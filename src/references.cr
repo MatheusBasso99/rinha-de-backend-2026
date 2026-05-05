@@ -1,19 +1,40 @@
 require "compress/gzip"
 require "json"
+require "./ivf_builder"
 
 module RinhaDeBackend
-  # Reference dataset for KNN. Stored densely:
+  # Reference dataset for KNN/IVF. Stored densely in a single binary
+  # file produced once at Docker build time and mmapped read-only at
+  # runtime.
   #
-  #   - `vectors`: Slice(Int16), length = count * DIMS, row-major.
-  #   - `labels` : Slice(UInt8), length = count, 1 = fraud, 0 = legit.
+  #   - `vectors`     : Slice(Int16), length = count * DIMS, row-major,
+  #                     reordered so that vectors of the same IVF cell
+  #                     are contiguous.
+  #   - `labels`      : Slice(UInt8), length = count, 1 = fraud, 0 = legit,
+  #                     reordered the same way as `vectors`.
+  #   - `centroids`   : Slice(Int16), length = k * DIMS, the IVF cell
+  #                     centers (quantized to the same scale as vectors).
+  #   - `cell_offsets`: Slice(UInt32), length = k + 1; cell `c` spans
+  #                     `vectors[cell_offsets[c]..cell_offsets[c+1])`.
   #
-  # Floats are quantized as `(v * 10_000).round.to_i16`. This is uniform: the
-  # `-1` sentinel for indices 5/6 (no last_transaction) maps to `-10_000`,
-  # which is naturally outside the [0, 10_000] band — so "no history"
-  # vectors keep clustering with each other in L2 space without any branch
-  # in the distance loop.
+  # Floats are quantized as `(v * 10_000).round.to_i16`. The `-1`
+  # sentinel for indices 5/6 (no last_transaction) maps to `-10_000`,
+  # naturally outside the [0, 10_000] band.
+  #
+  # Binary file format (little-endian, x86_64):
+  #
+  #   bytes  0..3   : magic "RNH2"
+  #   bytes  4..7   : count u32
+  #   bytes  8..11  : dims  u32 (= 14)
+  #   bytes 12..15  : k     u32 (number of IVF cells)
+  #   bytes 16..63  : reserved (zeroed)
+  #   bytes 64..    : vectors (count * dims * Int16, reordered by cell)
+  #   then          : labels  (count * UInt8, reordered by cell)
+  #   then          : centroids (k * dims * Int16)
+  #   then          : cell_offsets ((k + 1) * UInt32)
   class References
-    DEFAULT_PATH = "resources/references.json.gz"
+    DEFAULT_PATH     = "resources/references.json.gz"
+    DEFAULT_BIN_PATH = "resources/references.bin"
 
     DIMS  = 14
     SCALE = 10_000.0_f64
@@ -21,17 +42,111 @@ module RinhaDeBackend
     LABEL_LEGIT = 0_u8
     LABEL_FRAUD = 1_u8
 
-    # Upper bound from docs/en/DATASET.md (3,000,000 labeled vectors).
-    # Used as the initial allocation size; we trim to actual count.
     DEFAULT_CAPACITY = 3_000_000
+
+    HEADER_SIZE  =     64
+    HEADER_MAGIC = "RNH2"
 
     getter count : Int32
     getter vectors : Slice(Int16)
     getter labels : Slice(UInt8)
+    getter k : Int32
+    getter centroids : Slice(Int16)
+    getter cell_offsets : Slice(UInt32)
 
-    private def initialize(@count : Int32, @vectors : Slice(Int16), @labels : Slice(UInt8))
+    private def initialize(@count : Int32,
+                           @vectors : Slice(Int16),
+                           @labels : Slice(UInt8),
+                           @k : Int32 = 0,
+                           @centroids : Slice(Int16) = Slice(Int16).new(0, 0_i16),
+                           @cell_offsets : Slice(UInt32) = Slice(UInt32).new(0, 0_u32))
     end
 
+    # Mmap a pre-built binary file produced by `preprocess`.
+    def self.mmap(path : String = DEFAULT_BIN_PATH) : References
+      size_i64 = File.size(path)
+      raise "references.bin too small (#{size_i64} bytes)" if size_i64 < HEADER_SIZE
+
+      fd = LibC.open(path, LibC::O_RDONLY)
+      raise "open(#{path}) failed: errno=#{Errno.value}" if fd < 0
+
+      ptr = LibC.mmap(
+        Pointer(Void).null,
+        LibC::SizeT.new(size_i64),
+        LibC::PROT_READ,
+        LibC::MAP_SHARED | LibC::MAP_POPULATE,
+        fd,
+        0_i64
+      )
+      LibC.close(fd)
+      raise "mmap(#{path}) failed: errno=#{Errno.value}" if ptr == LibC::MAP_FAILED
+
+      base = ptr.as(UInt8*)
+      magic = String.new(base, 4)
+      raise "bad magic in #{path}: #{magic.inspect}" unless magic == HEADER_MAGIC
+
+      count = (base + 4).as(UInt32*).value.to_i32
+      dims  = (base + 8).as(UInt32*).value.to_i32
+      k     = (base + 12).as(UInt32*).value.to_i32
+      raise "dims mismatch in #{path}: #{dims} != #{DIMS}" unless dims == DIMS
+
+      vectors_off      = HEADER_SIZE
+      labels_off       = vectors_off + count * DIMS * sizeof(Int16)
+      centroids_off    = labels_off + count * sizeof(UInt8)
+      cell_offsets_off = centroids_off + k * DIMS * sizeof(Int16)
+      end_off          = cell_offsets_off + (k + 1) * sizeof(UInt32)
+      raise "size mismatch in #{path}: #{size_i64} != #{end_off}" unless size_i64 == end_off
+
+      vectors_ptr      = (base + vectors_off).as(Int16*)
+      labels_ptr       = (base + labels_off).as(UInt8*)
+      centroids_ptr    = (base + centroids_off).as(Int16*)
+      cell_offsets_ptr = (base + cell_offsets_off).as(UInt32*)
+
+      vectors      = Slice(Int16).new(vectors_ptr, count * DIMS, read_only: true)
+      labels       = Slice(UInt8).new(labels_ptr, count, read_only: true)
+      centroids    = Slice(Int16).new(centroids_ptr, k * DIMS, read_only: true)
+      cell_offsets = Slice(UInt32).new(cell_offsets_ptr, k + 1, read_only: true)
+
+      new(count, vectors, labels, k, centroids, cell_offsets)
+    end
+
+    # Builds the binary file by parsing JSON, running k-means and
+    # writing all sections in order. `output_io` must be seekable.
+    # Returns the number of records written.
+    def self.preprocess(json_io : IO,
+                        output_io : IO,
+                        k : Int32 = IvfBuilder::DEFAULT_K,
+                        iterations : Int32 = IvfBuilder::DEFAULT_ITERATIONS) : Int32
+      # Load all vectors into memory.
+      raw = load_from_io(json_io, capacity: DEFAULT_CAPACITY)
+
+      # Build IVF.
+      result = IvfBuilder.build(raw.vectors, raw.labels, raw.count, DIMS, k, iterations)
+
+      raise "output_io must be seekable" unless output_io.responds_to?(:seek)
+
+      # Header placeholder.
+      output_io.write(Bytes.new(HEADER_SIZE, 0_u8))
+
+      # Sections.
+      output_io.write(result.vectors.to_unsafe_bytes)
+      output_io.write(result.labels.to_unsafe_bytes)
+      output_io.write(result.centroids.to_unsafe_bytes)
+      output_io.write(result.cell_offsets.to_unsafe_bytes)
+
+      # Backfill header.
+      output_io.seek(0)
+      output_io.write(HEADER_MAGIC.to_slice)
+      output_io.write_bytes(raw.count.to_u32, IO::ByteFormat::LittleEndian)
+      output_io.write_bytes(DIMS.to_u32, IO::ByteFormat::LittleEndian)
+      output_io.write_bytes(k.to_u32, IO::ByteFormat::LittleEndian)
+      output_io.write_bytes(0_u32, IO::ByteFormat::LittleEndian)
+
+      raw.count
+    end
+
+    # Legacy gzip+JSON loader. Used by `preprocess` and by tests
+    # against `example-references.json`.
     def self.load(path : String = DEFAULT_PATH) : References
       File.open(path, "rb") do |file|
         Compress::Gzip::Reader.open(file) do |gz|
@@ -40,8 +155,7 @@ module RinhaDeBackend
       end
     end
 
-    # Stream-parse the JSON array from `io`, filling pre-allocated
-    # contiguous slices.
+    # Stream-parse the JSON array from `io` into pre-allocated slices.
     def self.load_from_io(io : IO, capacity : Int32 = DEFAULT_CAPACITY) : References
       pull = JSON::PullParser.new(io)
 
@@ -51,7 +165,6 @@ module RinhaDeBackend
 
       pull.read_array do
         if i >= capacity
-          # Unlikely; double the buffers and copy.
           new_capacity = capacity * 2
           new_vectors = Slice(Int16).new(new_capacity * DIMS, 0_i16)
           new_labels  = Slice(UInt8).new(new_capacity, 0_u8)
@@ -85,7 +198,6 @@ module RinhaDeBackend
         i += 1
       end
 
-      # Trim to actual count.
       if i < capacity
         trimmed_vectors = Slice(Int16).new(i * DIMS, 0_i16)
         trimmed_labels  = Slice(UInt8).new(i, 0_u8)

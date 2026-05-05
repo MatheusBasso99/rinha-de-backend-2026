@@ -1,6 +1,7 @@
 require "./spec_helper"
 require "../src/references"
 require "../src/knn"
+require "../src/ivf"
 
 describe RinhaDeBackend::References do
   it "loads the example-references.json fixture" do
@@ -12,10 +13,6 @@ describe RinhaDeBackend::References do
     refs.vectors.size.should eq(100 * RinhaDeBackend::References::DIMS)
     refs.labels.size.should eq(100)
 
-    # First reference, from the file:
-    #   {"vector":[0.01, 0.0833, 0.05, 0.8261, 0.1667, -1, -1,
-    #              0.0432, 0.25, 0, 1, 0, 0.2, 0.0416],
-    #    "label":"legit"}
     expected = [100_i16, 833_i16, 500_i16, 8261_i16, 1667_i16,
                 -10_000_i16, -10_000_i16, 432_i16, 2500_i16, 0_i16,
                 10_000_i16, 0_i16, 2000_i16, 416_i16]
@@ -26,6 +23,60 @@ describe RinhaDeBackend::References do
 
     refs.labels[0].should eq(RinhaDeBackend::References::LABEL_LEGIT)
   end
+
+  it "round-trips example-references through preprocess + mmap with IVF" do
+    bin_path = File.join(Dir.tempdir, "rinha-refs-#{Random::Secure.hex(8)}.bin")
+    begin
+      count = File.open("resources/example-references.json", "r") do |json_io|
+        File.open(bin_path, "wb") do |bin_io|
+          # Small K so the 100-vector fixture isn't degenerate.
+          RinhaDeBackend::References.preprocess(json_io, bin_io, k: 4, iterations: 5)
+        end
+      end
+      count.should eq(100)
+
+      refs = RinhaDeBackend::References.mmap(bin_path)
+      refs.count.should eq(100)
+      refs.k.should eq(4)
+      refs.vectors.size.should eq(100 * RinhaDeBackend::References::DIMS)
+      refs.labels.size.should eq(100)
+      refs.centroids.size.should eq(4 * RinhaDeBackend::References::DIMS)
+      refs.cell_offsets.size.should eq(5)
+
+      # cell_offsets are cumulative: last entry must equal count.
+      refs.cell_offsets[4].should eq(100_u32)
+      # Cells must be non-decreasing (sanity check on the layout).
+      4.times do |i|
+        refs.cell_offsets[i].should be <= refs.cell_offsets[i + 1]
+      end
+    ensure
+      File.delete(bin_path) if File.exists?(bin_path)
+    end
+  end
+
+  it "ivf agrees with brute-force on every fixture vector (recall = 100%)" do
+    bin_path = File.join(Dir.tempdir, "rinha-refs-#{Random::Secure.hex(8)}.bin")
+    begin
+      File.open("resources/example-references.json", "r") do |json_io|
+        File.open(bin_path, "wb") do |bin_io|
+          RinhaDeBackend::References.preprocess(json_io, bin_io, k: 4, iterations: 5)
+        end
+      end
+
+      refs = RinhaDeBackend::References.mmap(bin_path)
+      knn = RinhaDeBackend::Knn.new(refs)
+      ivf = RinhaDeBackend::Ivf.new(refs, nprobe: 4) # nprobe == k → exact
+
+      refs.count.times do |i|
+        query = StaticArray(Int16, 14).new(0_i16)
+        14.times { |j| query[j] = refs.vectors[i * 14 + j] }
+
+        ivf.fraud_count_top_k(query).should eq(knn.fraud_count_top_k(query))
+      end
+    ensure
+      File.delete(bin_path) if File.exists?(bin_path)
+    end
+  end
 end
 
 describe RinhaDeBackend::Knn do
@@ -35,9 +86,6 @@ describe RinhaDeBackend::Knn do
   knn = RinhaDeBackend::Knn.new(refs)
 
   it "returns 0 frauds when nearest neighbors are all legit" do
-    # Pick the first reference as the query — distance to itself is 0,
-    # so it is one of the top-5. The example dataset is mostly legit at
-    # the top, so a self-query should return 0 frauds.
     query = StaticArray(Int16, 14).new(0_i16)
     14.times { |i| query[i] = refs.vectors[i] }
 
@@ -45,8 +93,6 @@ describe RinhaDeBackend::Knn do
   end
 
   it "honors the -10_000 sentinel for missing-history dimensions" do
-    # All-sentinel query must match references with sentinel at idx 5/6
-    # before others. Asserting only that the call runs and returns 0..K.
     query = StaticArray(Int16, 14).new(-10_000_i16)
     result = knn.fraud_count_top_k(query)
     result.should be >= 0
