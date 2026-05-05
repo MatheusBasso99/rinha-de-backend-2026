@@ -23,12 +23,12 @@ x-api: &api
     - "9999"
   healthcheck:
     test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9999/ready"]
-    interval: 5s
+    interval: 2s
     timeout: 2s
-    retries: 30
-    # Loading + parsing references.json.gz (50 MB gzipped, 3M records)
-    # takes a while on first boot. Don't mark unhealthy during that window.
-    start_period: 90s
+    retries: 10
+    # Boot is now O(open + mmap) since references.bin is built into the
+    # image. 10s start_period leaves slack for the first scheduling tick.
+    start_period: 10s
   deploy:
     resources:
       limits:

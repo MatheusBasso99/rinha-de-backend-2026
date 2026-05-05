@@ -1,6 +1,13 @@
 # syntax=docker/dockerfile:1.7
 # -----------------------------------------------------------------------------
-# Build stage: Crystal 1.20.0 on Alpine, statically linked binary for amd64.
+# Build stage: Crystal 1.20.0 on Alpine, statically linked binaries for amd64.
+#
+# Two artifacts are produced here:
+#   - rinha_de_backend : the HTTP server (runtime).
+#   - preprocess       : converts references.json.gz into the binary format
+#                        consumed via mmap at runtime. Run once during the
+#                        build; the resulting .bin ships with the runtime
+#                        image, the original .gz does not.
 # -----------------------------------------------------------------------------
 FROM --platform=linux/amd64 crystallang/crystal:1.20.0-alpine AS build
 
@@ -24,6 +31,7 @@ RUN shards install --production --frozen 2>/dev/null \
     || true
 
 COPY src ./src
+COPY resources ./resources
 
 RUN crystal build \
     --release \
@@ -33,16 +41,37 @@ RUN crystal build \
     src/main.cr \
  && strip /build/rinha_de_backend
 
+# Build the preprocess CLI and run it — but only if the build context
+# didn't already ship a `references.bin`. The k-means step takes a few
+# minutes; allowing developers to commit a pre-built `.bin` (locally
+# only — it stays gitignored) cuts the dev cycle dramatically.
+RUN if [ ! -f resources/references.bin ]; then \
+      crystal build \
+        --release \
+        --no-debug \
+        --static \
+        -o /build/preprocess \
+        src/preprocess.cr \
+     && strip /build/preprocess \
+     && /build/preprocess resources/references.json.gz resources/references.bin \
+     && rm /build/preprocess; \
+    else \
+      echo "[build] using cached resources/references.bin from build context"; \
+    fi \
+ && rm -f resources/references.json.gz
+
 # -----------------------------------------------------------------------------
-# Runtime stage: minimal Alpine. The binary is fully static, but Alpine gives
-# us wget for the healthcheck and a writable /tmp without extra effort.
+# Runtime stage: minimal Alpine. Binary is fully static; Alpine gives us
+# wget for the healthcheck.
 # -----------------------------------------------------------------------------
 FROM --platform=linux/amd64 alpine:3.20
 
 WORKDIR /app
 
-COPY resources ./resources
-COPY --from=build /build/rinha_de_backend /usr/local/bin/rinha_de_backend
+COPY --from=build /build/resources/references.bin    ./resources/references.bin
+COPY --from=build /build/resources/normalization.json ./resources/normalization.json
+COPY --from=build /build/resources/mcc_risk.json     ./resources/mcc_risk.json
+COPY --from=build /build/rinha_de_backend            /usr/local/bin/rinha_de_backend
 
 EXPOSE 9999
 
