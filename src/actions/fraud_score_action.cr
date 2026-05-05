@@ -1,8 +1,8 @@
-require "json"
 require "./base_action"
-require "../payload"
+require "../json_parser"
+require "../parsed_request"
 require "../vectorizer"
-require "../knn"
+require "../ivf"
 require "../references"
 
 module RinhaDeBackend
@@ -25,15 +25,31 @@ module RinhaDeBackend
     # legit answer is cheaper than a 5xx (Err weighs 5x in scoring).
     FALLBACK_BODY = RESPONSES[0]
 
-    def initialize(@vectorizer : Vectorizer, @knn : Knn)
+    # Body buffer size. The Rinha schema fits comfortably under 1 KB; 4 KB
+    # gives headroom for whitespace-heavy payloads. The buffer lives on the
+    # fiber stack (uninitialized StaticArray), so it costs nothing per
+    # request and survives I/O yields.
+    BODY_BUF_SIZE = 4096
+
+    def initialize(@vectorizer : Vectorizer, @ivf : Ivf)
     end
 
     def call(context : HTTP::Server::Context) : Nil
       body = context.request.body
       return respond_json(context, 200, FALLBACK_BODY) unless body
 
-      req = FraudScoreRequest.from_json(body)
-      vec_f = @vectorizer.vectorize(req)
+      buf_storage = uninitialized StaticArray(UInt8, 4096)
+      slice = buf_storage.to_slice
+      total = 0
+      while total < slice.size
+        n = body.read(slice + total)
+        break if n == 0
+        total += n
+      end
+      buf = slice[0, total]
+
+      parsed = JsonParser.parse(buf)
+      vec_f = @vectorizer.vectorize(buf, parsed)
 
       # Quantize Float32 → Int16 (same scale used by References).
       query = StaticArray(Int16, 14).new(0_i16)
@@ -41,7 +57,7 @@ module RinhaDeBackend
         query[i] = (vec_f[i] * References::SCALE.to_f32).round.to_i16
       end
 
-      frauds = @knn.fraud_count_top_k(query)
+      frauds = @ivf.fraud_count_top_k(query)
       respond_json(context, 200, RESPONSES.unsafe_fetch(frauds))
     rescue ex
       respond_json(context, 200, FALLBACK_BODY)

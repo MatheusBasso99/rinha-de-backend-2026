@@ -33,3 +33,15 @@ Thumbs.db
 # Large dataset — re-downloadable from the official repo. Baked into the
 # Docker image at build time via `COPY resources`.
 /resources/references.json.gz
+
+# Pre-processed binary dataset. Built either by Dockerfile during
+# image build, or locally via `crystal run src/preprocess.cr` to skip
+# the multi-minute k-means step on subsequent docker builds. Not
+# checked in either way.
+/resources/references.bin
+
+# Local performance log — kept out of the repo, lives next to the code.
+/RESULTS.md
+
+# Local backlog — dev-loop notes only, not part of the submission.
+/TODO.md

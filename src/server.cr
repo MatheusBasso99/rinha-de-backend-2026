@@ -2,9 +2,14 @@ require "http/server"
 require "./mcc_risk"
 require "./vectorizer"
 require "./references"
-require "./knn"
+require "./ivf"
 require "./actions/ready_action"
 require "./actions/fraud_score_action"
+
+@[Link("gc")]
+lib LibGC
+  fun enable_incremental = GC_enable_incremental : Void
+end
 
 module RinhaDeBackend
   class Server
@@ -17,17 +22,29 @@ module RinhaDeBackend
       log_phase "loading mcc_risk"
       mcc_risk = MccRisk.new
 
-      log_phase "loading references"
-      refs = References.load
-      log_phase "loaded #{refs.count} references"
+      log_phase "mmapping references"
+      refs = References.mmap
+      log_phase "mmapped #{refs.count} references"
 
       vectorizer = Vectorizer.new(mcc_risk)
-      knn = Knn.new(refs)
+      ivf = Ivf.new(refs)
+      log_phase "ivf ready: k=#{refs.k} nprobe=#{Ivf::DEFAULT_NPROBE}"
 
-      @routes = build_routes(vectorizer, knn)
+      @routes = build_routes(vectorizer, ivf)
     end
 
     def listen : Nil
+      # Switch BDW GC into incremental mode: instead of stopping the
+      # world for one long mark cycle, the collector does small slices
+      # interleaved with mutator work. Trade-off: a bit more total
+      # CPU for a much flatter tail. We rely on this because the hot
+      # path still allocates inside HTTP::Server (per-request Request /
+      # Response / header Hashes); a full GC.disable would OOM in
+      # seconds. See TODO.md for the planned move off HTTP::Server.
+      GC.collect
+      LibGC.enable_incremental
+      log_phase "GC incremental mode enabled (heap_size=#{GC.stats.heap_size})"
+
       log_phase "listening on #{@host}:#{@port}"
       server = HTTP::Server.new do |context|
         dispatch(context)
@@ -36,10 +53,10 @@ module RinhaDeBackend
       server.listen
     end
 
-    private def build_routes(vectorizer : Vectorizer, knn : Knn) : Hash(Tuple(String, String), BaseAction)
+    private def build_routes(vectorizer : Vectorizer, ivf : Ivf) : Hash(Tuple(String, String), BaseAction)
       actions = [
         ReadyAction.new,
-        FraudScoreAction.new(vectorizer, knn),
+        FraudScoreAction.new(vectorizer, ivf),
       ] of BaseAction
 
       actions.each_with_object({} of Tuple(String, String) => BaseAction) do |action, table|
