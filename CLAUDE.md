@@ -1,135 +1,197 @@
-# Rinha de Backend 2026 — Detecção de Fraude com Busca Vetorial
+# Rinha de Backend 2026 — Fraud Detection with Vector Search
 
-Este projeto é a submissão para a **Rinha de Backend 2026** usando **Crystal lang 1.20.0**.
+This project is the submission for **Rinha de Backend 2026** using **Crystal lang 1.20.0**.
 
-## Documentação canônica (sempre consultar)
+## Canonical documentation (always consult)
 
-- **Repositório oficial**: https://github.com/zanfranceschi/rinha-de-backend-2026
-- **Docs do desafio (PT-BR)**: https://github.com/zanfranceschi/rinha-de-backend-2026/tree/main/docs/br
-  - `README.md`, `API.md`, `ARQUITETURA.md`, `AVALIACAO.md`,
-    `BUSCA_VETORIAL.md`, `DATASET.md`, `REGRAS_DE_DETECCAO.md`,
-    `SUBMISSAO.md`, `FAQ.md`
-- **Crystal lang API 1.20.1** (sempre referenciar antes de escrever código): https://crystal-lang.org/api/1.20.1/
-  - Em qualquer dúvida sobre stdlib (`HTTP::Server`, `JSON`, `Channel`, `Fiber`,
-    `Slice`, `Math`, `Compress::Gzip`, etc.), abrir a doc dessa versão.
-  - Não inventar APIs; se houver dúvida, ler a página correspondente em
+- **Official repo**: https://github.com/zanfranceschi/rinha-de-backend-2026
+- **Challenge docs (English)**: https://github.com/zanfranceschi/rinha-de-backend-2026/tree/main/docs/en
+  - `README.md`, `API.md`, `ARCHITECTURE.md`, `EVALUATION.md`,
+    `VECTOR_SEARCH.md`, `DATASET.md`, `DETECTION_RULES.md`,
+    `SUBMISSION.md`, `FAQ.md`
+- **Crystal lang API 1.20.1** (always cross-check before writing stdlib code):
+  https://crystal-lang.org/api/1.20.1/
+  - For any doubt about stdlib (`HTTP::Server`, `JSON`, `Channel`, `Fiber`,
+    `Slice`, `Math`, `Compress::Gzip`, etc.), open the page for that exact
+    version. Do not invent APIs — read the corresponding page on
     `crystal-lang.org/api/1.20.1/`.
+- **Crystal GC module**: https://crystal-lang.org/api/1.20.1/GC.html
+  (used by the GC strategy below).
 
-## Tema do desafio
+## Challenge theme
 
-Construir o módulo **`fraud-score`**: para cada transação, transformar o payload
-em um vetor de **14 dimensões**, buscar os **5 vizinhos mais próximos** no
-dataset de referência (3 milhões de vetores rotulados) e responder com
-`approved` e `fraud_score = nº_de_fraudes / 5`. Threshold fixo: `0.6`.
+Build the **`fraud-score`** module: for each transaction, transform the payload
+into a **14-dimension vector**, find the **5 nearest neighbors** in the
+reference dataset (3 million labeled vectors) and answer with `approved` and
+`fraud_score = number_of_frauds / 5`. Fixed threshold: `0.6`.
 
-## Endpoints (porta 9999)
+## Endpoints (port 9999)
 
-- `GET /ready` → `2xx` quando a API está pronta.
-- `POST /fraud-score` → recebe transação, devolve `{ "approved": bool, "fraud_score": number }`.
+- `GET /ready` → `2xx` once the API is ready.
+- `POST /fraud-score` → receives the transaction, returns
+  `{ "approved": bool, "fraud_score": number }`.
 
-Contrato completo dos campos: `docs/br/API.md`.
+Full field contract: `docs/en/API.md`.
 
-## Vetorização (14 dimensões)
+## Vectorization (14 dimensions)
 
-Ordem fixa, normalização via `clamp(x, 0.0, 1.0)` exceto índices 5 e 6 (que
-podem ser `-1` quando `last_transaction == null`):
+Fixed order, normalization via `clamp(x, 0.0, 1.0)` except indices 5 and 6
+(which can be `-1` when `last_transaction == null`):
 
-| idx | dimensão | fórmula |
-|-----|----------|---------|
+| idx | dimension | formula |
+|-----|-----------|---------|
 | 0 | `amount` | `amount / max_amount` |
 | 1 | `installments` | `installments / max_installments` |
 | 2 | `amount_vs_avg` | `(amount / customer.avg_amount) / amount_vs_avg_ratio` |
 | 3 | `hour_of_day` | `hour(requested_at) / 23` (UTC) |
-| 4 | `day_of_week` | `dow(requested_at) / 6` (seg=0, dom=6) |
-| 5 | `minutes_since_last_tx` | `min / max_minutes` ou `-1` |
-| 6 | `km_from_last_tx` | `km / max_km` ou `-1` |
+| 4 | `day_of_week` | `dow(requested_at) / 6` (Mon=0, Sun=6) |
+| 5 | `minutes_since_last_tx` | `min / max_minutes` or `-1` |
+| 6 | `km_from_last_tx` | `km / max_km` or `-1` |
 | 7 | `km_from_home` | `km_from_home / max_km` |
 | 8 | `tx_count_24h` | `tx_count_24h / max_tx_count_24h` |
-| 9 | `is_online` | `1` ou `0` |
-| 10 | `card_present` | `1` ou `0` |
-| 11 | `unknown_merchant` | `1` se `merchant.id ∉ known_merchants` |
+| 9 | `is_online` | `1` or `0` |
+| 10 | `card_present` | `1` or `0` |
+| 11 | `unknown_merchant` | `1` if `merchant.id ∉ known_merchants` |
 | 12 | `mcc_risk` | `mcc_risk[mcc]` (default `0.5`) |
 | 13 | `merchant_avg_amount` | `merchant.avg_amount / max_merchant_avg_amount` |
 
-Constantes em `resources/normalization.json`. MCCs em `resources/mcc_risk.json`.
+Constants in `resources/normalization.json`. MCC risks in
+`resources/mcc_risk.json`.
 
-## Dataset de referência
+## Reference dataset
 
-- `references.json.gz` — 3.000.000 vetores rotulados (`fraud` / `legit`),
-  ~16 MB gzipado / ~284 MB descompactado.
-- `mcc_risk.json` — risco por MCC (default `0.5`).
-- `normalization.json` — constantes.
+- `references.json.gz` — 3,000,000 labeled vectors (`fraud` / `legit`),
+  ~16 MB gzipped / ~284 MB uncompressed.
+- `mcc_risk.json` — risk per MCC (default `0.5`).
+- `normalization.json` — constants.
 
-**Os arquivos não mudam entre testes.** Pré-processar no build/startup é
-permitido e recomendado (formato binário, índice ANN, mmap, etc.) para tirar
-custo do hot path.
+**The files do not change between test runs.** Pre-processing at build/startup
+is allowed and recommended (binary format, ANN index, mmap, etc.) to move cost
+out of the hot path.
 
-## Decisão
+## Decision
 
-1. Vetorizar payload (14 dims).
-2. Buscar 5 vizinhos mais próximos (KNN exato, ANN — HNSW/IVF/VP-Tree —, ou
-   qualquer técnica que mantenha precisão e p99 baixos).
-3. `fraud_score = fraudes_entre_os_5 / 5`.
+1. Vectorize payload (14 dims).
+2. Find 5 nearest neighbors (exact KNN, ANN — HNSW/IVF/VP-Tree —, or any
+   technique that keeps both precision and p99 acceptable).
+3. `fraud_score = frauds_in_top5 / 5`.
 4. `approved = fraud_score < 0.6`.
 
-## Restrições de infra
+## Infrastructure constraints
 
-- ≥ 1 load balancer + ≥ 2 instâncias da API, **round-robin simples** (sem
-  lógica de negócio no LB — não inspeciona payload, não responde, não decide).
-- Submissão = `docker-compose.yml` na branch `submission`, imagens públicas,
-  compatíveis com `linux/amd64`.
-- Soma dos limites: **≤ 1 CPU e ≤ 350 MB RAM** entre todos os serviços.
-- Network mode `bridge`. `host` e `privileged` proibidos.
-- App responde em `localhost:9999`.
+- ≥ 1 load balancer + ≥ 2 API instances, **simple round-robin** (the LB must
+  not run business logic — no payload inspection, no responding, no deciding).
+- Submission = `docker-compose.yml` on the `submission` branch, public images,
+  compatible with `linux/amd64`.
+- Sum of all service limits: **≤ 1 CPU and ≤ 350 MB RAM**.
+- Network mode `bridge`. `host` and `privileged` are forbidden.
+- App responds on `localhost:9999`.
 
-## Pontuação (resumo prático)
+## Scoring (practical summary)
 
-`final_score = score_p99 + score_det`, cada um em `[-3000, +3000]` →
-total em `[-6000, +6000]`.
+`final_score = score_p99 + score_det`, each clamped to `[-3000, +3000]` →
+total in `[-6000, +6000]`.
 
-- **Latência (`score_p99`)**: `1000 · log₁₀(1000ms / max(p99, 1ms))`.
-  Teto +3000 quando `p99 ≤ 1ms`. **Piso −3000 quando `p99 > 2000ms`.**
-- **Detecção (`score_det`)**: `1000 · log₁₀(1/ε) − 300 · log₁₀(1 + E)`,
-  onde `E = 1·FP + 3·FN + 5·Err`, `ε = E / N`.
-  **Piso fixo −3000 quando `(FP+FN+Err) / N > 15%`.**
+- **Latency (`score_p99`)**: `1000 · log₁₀(1000ms / max(p99, 1ms))`.
+  Ceiling +3000 when `p99 ≤ 1ms`. **Floor −3000 when `p99 > 2000ms`.**
+- **Detection (`score_det`)**: `1000 · log₁₀(1/ε) − 300 · log₁₀(1 + E)`,
+  where `E = 1·FP + 3·FN + 5·Err` and `ε = E / N`.
+  **Hard −3000 floor when `(FP+FN+Err) / N > 15%`.**
 
-Implicações:
-- Cada **10× mais rápido** vale +1000 pontos no `score_p99`. Otimizar abaixo
-  de 1ms é inútil (satura).
-- `Err` (HTTP ≠ 200) pesa 5 e ainda conta como falha bruta — em pânico,
-  responder 200 com `{ approved: true, fraud_score: 0.0 }` é melhor que 500.
-- O corte de 15% de falhas é rígido: passou disso, `score_det = −3000` e
-  qualquer p99 fica anulado.
-- Não usar payloads do teste (`test/test-data.json`) como dataset/lookup:
-  proibido pelas regras.
+Implications:
+- Each **10× faster** is worth +1000 points on `score_p99`. Optimizing below
+  1ms is wasted (saturates).
+- `Err` (HTTP ≠ 200) has weight 5 and also counts as raw failure — when
+  panicking, returning `200` with `{ approved: true, fraud_score: 0.0 }` beats
+  a 5xx.
+- The 15% failure cut is hard: cross it and `score_det = −3000`, nullifying
+  any p99 gain.
+- Do **not** use the test payloads (`test/test-data.json`) as a
+  dataset/lookup — explicitly forbidden.
 
-## Submissão
+## Submission
 
-- PR adicionando `participants/<github-user>.json` listando os repos.
-- Repo precisa ser público; com branches `main` (código) e `submission`
-  (apenas artefatos do compose).
-- Para teste oficial: abrir issue no repo do desafio com `rinha/test [id]` na
-  descrição. A engine roda, comenta resultado e fecha.
+- PR adding `participants/<github-user>.json` listing the repos.
+- Repo must be public; with branches `main` (source) and `submission` (only
+  compose-time artifacts).
+- For the official run: open an issue on the challenge repo with
+  `rinha/test [id]` in the description. The Rinha engine runs it, comments
+  the result, and closes the issue.
 
-## Ambiente de teste oficial
+## Official test environment
 
 Mac Mini Late 2014, 2.6 GHz, 8 GB RAM, Ubuntu 24.04 (`linux/amd64`).
 
-## Diretrizes para colaboração neste projeto
+## Garbage Collector strategy
 
-- **Idioma**: PT-BR.
-- **Performance é tudo**: zero-alocação no hot path, evitar GC pressure,
-  pré-computar tudo que puder no startup (descomprimir e parsear o dataset
-  para representação binária densa em `Slice(Float32)` ou similar).
-- **Concorrência**: usar `Fiber`/`Channel` da Crystal; HTTP keep-alive;
-  considerar `HTTP::Server` puro vs frameworks.
-- **Memória apertada (350 MB total)**: 3M × 14 × 4 bytes ≈ 168 MB só para os
-  vetores. Cuidar de overhead de objetos; preferir `Slice(Float32)` contíguo
-  em vez de `Array(Array(Float64))`.
-- **Decisões de algoritmo**: brute-force `O(N · D)` provavelmente não cabe no
-  p99 alvo; considerar VP-Tree, HNSW, IVF ou quantização. Medir antes de
-  complicar.
-- **Antes de codar contra a stdlib**, abrir
-  https://crystal-lang.org/api/1.20.1/ na classe/módulo correspondente.
-- **Sem mocks no caminho crítico** que escondam custo real (parsing JSON,
-  alocação, conversão Float).
+This is **not production code** — we optimize aggressively for benchmark
+behavior. Crystal exposes the GC via the `GC` module
+(https://crystal-lang.org/api/1.20.1/GC.html):
+
+- `GC.disable` — turns the collector off (no pauses).
+- `GC.enable` — turns it back on.
+- `GC.collect` — forces a collection cycle.
+- `GC.malloc` / `GC.malloc_atomic` / `GC.realloc` / `GC.free` — manual
+  allocation primitives.
+- `GC.add_finalizer`, `GC.add_root`, `GC.stats`, etc.
+
+**Default policy for this project: disable the GC whenever possible.**
+
+Recommended pattern:
+
+```crystal
+# Startup: load and pre-process the dataset, warm caches, allocate everything
+# we expect to keep around (Slice(Float32) buffers, ANN index, etc.).
+load_references!
+warm_up!
+
+# After warm-up, before serving traffic, call:
+GC.collect    # one final compaction to start clean
+GC.disable    # no GC pauses during the benchmark hot path
+```
+
+Why this is acceptable here:
+- The benchmark is bounded in duration; we are not designed to survive for
+  days.
+- The 350 MB / 1 CPU envelope is fully consumed by the dataset + working
+  buffers we already need; transient per-request allocations should be small
+  and short-lived if the hot path is written carefully.
+- Removing GC pauses helps `score_p99` directly — pauses on the tail are
+  exactly what blow up p99.
+
+Why this is risky (and how to mitigate):
+- With `GC.disable`, transient allocations are never reclaimed → memory grows
+  monotonically until OOM.
+  Mitigation: keep the hot path **zero-allocation** (reuse `IO::Memory`
+  buffers, reuse `Slice(Float32)` query vectors, parse JSON in place into
+  pre-allocated structs, avoid `String#split`, avoid implicit `to_s`).
+- If memory does climb, the safety valve is to flip back: `GC.enable;
+  GC.collect; GC.disable` between bursts (off the hot path), or just leave
+  the GC enabled for that instance.
+- Always measure: `GC.stats` gives `heap_size`, `free_bytes`,
+  `unmapped_bytes`, `bytes_since_gc`, `total_bytes` — log them periodically
+  (off the hot path) to confirm the assumption holds.
+
+If, while writing code, you cannot guarantee zero-allocation in the hot path
+for a given feature, **say so explicitly** before disabling the GC — the
+trade-off must be conscious.
+
+## Collaboration guidelines for this project
+
+- **Language**: PT-BR with the user; CLAUDE.md and source comments in English.
+- **Performance is everything**: zero-allocation in the hot path, avoid GC
+  pressure (and prefer disabling the GC, see above), pre-compute everything
+  possible at startup (decompress and parse the dataset into a dense binary
+  representation like `Slice(Float32)` or similar).
+- **Concurrency**: use Crystal `Fiber`/`Channel`; HTTP keep-alive; consider
+  raw `HTTP::Server` vs frameworks.
+- **Tight memory (350 MB total)**: 3M × 14 × 4 bytes ≈ 168 MB just for the
+  vectors. Watch object overhead; prefer contiguous `Slice(Float32)` over
+  `Array(Array(Float64))`.
+- **Algorithm choices**: brute-force `O(N · D)` likely will not fit the p99
+  target; consider VP-Tree, HNSW, IVF, or quantization. Measure before
+  complicating.
+- **Before using stdlib**, open
+  https://crystal-lang.org/api/1.20.1/ for the matching class/module.
+- **No mocks on the critical path** that would hide real cost (JSON parsing,
+  allocation, Float conversion).
