@@ -1,4 +1,6 @@
 require "http/server"
+require "./mcc_risk"
+require "./vectorizer"
 require "./actions/ready_action"
 require "./actions/fraud_score_action"
 
@@ -10,7 +12,9 @@ module RinhaDeBackend
     @routes : Hash(Tuple(String, String), BaseAction)
 
     def initialize(@host : String = DEFAULT_HOST, @port : Int32 = DEFAULT_PORT)
-      @routes = build_routes
+      mcc_risk = MccRisk.new
+      vectorizer = Vectorizer.new(mcc_risk)
+      @routes = build_routes(vectorizer)
     end
 
     def listen : Nil
@@ -21,10 +25,10 @@ module RinhaDeBackend
       server.listen
     end
 
-    private def build_routes : Hash(Tuple(String, String), BaseAction)
+    private def build_routes(vectorizer : Vectorizer) : Hash(Tuple(String, String), BaseAction)
       actions = [
         ReadyAction.new,
-        FraudScoreAction.new,
+        FraudScoreAction.new(vectorizer),
       ] of BaseAction
 
       actions.each_with_object({} of Tuple(String, String) => BaseAction) do |action, table|
