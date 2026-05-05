@@ -33,6 +33,13 @@ RUN shards install --production --frozen 2>/dev/null \
 COPY src ./src
 COPY resources ./resources
 
+# Compile the vendored picohttpparser to a static .o first. src/picohttp.cr
+# wires it into the final binary via `@[Link(ldflags: "#{__DIR__}/.../picohttpparser.o")]`,
+# so the object must exist before `crystal build` runs.
+RUN cc -O3 -fPIC -fno-stack-protector -DNDEBUG \
+       -c src/ext/picohttpparser/picohttpparser.c \
+       -o src/ext/picohttpparser/picohttpparser.o
+
 RUN crystal build \
     --release \
     --no-debug \

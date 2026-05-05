@@ -5,6 +5,12 @@
 *.dwarf
 shard.override.yml
 
+# Local release binary (built by `make build` / `make release`).
+/rinha_de_backend
+
+# Compiled vendored C objects (Makefile + Dockerfile rebuild on demand).
+*.o
+
 # crystal docs (generated API docs)
 /docs/
 

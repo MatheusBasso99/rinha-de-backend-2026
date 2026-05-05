@@ -1,22 +1,22 @@
-require "http/server"
 require "./mcc_risk"
 require "./vectorizer"
 require "./references"
 require "./ivf"
-require "./actions/ready_action"
-require "./actions/fraud_score_action"
-
-@[Link("gc")]
-lib LibGC
-  fun enable_incremental = GC_enable_incremental : Void
-end
+require "./http_server"
 
 module RinhaDeBackend
+  # Composition root: load mmapped references + MCC risks, build the
+  # vectorizer/IVF index, then hand control to the raw HTTP/1.1 server
+  # in `HttpServer`. Everything below is one-shot startup work; the hot
+  # path lives in HttpServer#handle.
   class Server
-    DEFAULT_HOST = "0.0.0.0"
-    DEFAULT_PORT = 9999
+    DEFAULT_HOST = HttpServer::DEFAULT_HOST
+    DEFAULT_PORT = HttpServer::DEFAULT_PORT
 
-    @routes : Hash(Tuple(String, String), BaseAction)
+    # Period (seconds) between GC.stats snapshots emitted on STDERR. Off
+    # the hot path; gives us cheap visibility on whether the heap is
+    # actually static under load. 0 disables the monitor.
+    GC_STATS_PERIOD = 5
 
     def initialize(@host : String = DEFAULT_HOST, @port : Int32 = DEFAULT_PORT)
       log_phase "loading mcc_risk"
@@ -30,46 +30,34 @@ module RinhaDeBackend
       ivf = Ivf.new(refs)
       log_phase "ivf ready: k=#{refs.k} nprobe=#{Ivf::DEFAULT_NPROBE}"
 
-      @routes = build_routes(vectorizer, ivf)
+      @http = HttpServer.new(@host, @port, vectorizer, ivf)
     end
 
     def listen : Nil
-      # Switch BDW GC into incremental mode: instead of stopping the
-      # world for one long mark cycle, the collector does small slices
-      # interleaved with mutator work. Trade-off: a bit more total
-      # CPU for a much flatter tail. We rely on this because the hot
-      # path still allocates inside HTTP::Server (per-request Request /
-      # Response / header Hashes); a full GC.disable would OOM in
-      # seconds. See TODO.md for the planned move off HTTP::Server.
+      # Hot path is now zero-allocation: HttpServer reuses an 8 KB stack
+      # buffer per fiber, picohttpparser does the parse in C, JsonParser
+      # writes into a stack struct, response Bytes are pre-rendered
+      # constants, and IVF runs over mmapped Int16 slices outside the
+      # GC heap. Under those invariants we can drop the collector
+      # entirely and remove the last source of tail-latency variance.
+      #
+      # Safety valve: a watchdog fiber logs GC.stats every few seconds.
+      # If heap_size grows monotonically here, we know an allocation
+      # leaked into the hot path and can flip back to incremental.
       GC.collect
-      LibGC.enable_incremental
-      log_phase "GC incremental mode enabled (heap_size=#{GC.stats.heap_size})"
+      GC.disable
+      log_phase "GC disabled (heap_size=#{GC.stats.heap_size})"
 
-      log_phase "listening on #{@host}:#{@port}"
-      server = HTTP::Server.new do |context|
-        dispatch(context)
-      end
-      server.bind_tcp(@host, @port)
-      server.listen
+      spawn gc_stats_loop if GC_STATS_PERIOD > 0
+
+      @http.listen
     end
 
-    private def build_routes(vectorizer : Vectorizer, ivf : Ivf) : Hash(Tuple(String, String), BaseAction)
-      actions = [
-        ReadyAction.new,
-        FraudScoreAction.new(vectorizer, ivf),
-      ] of BaseAction
-
-      actions.each_with_object({} of Tuple(String, String) => BaseAction) do |action, table|
-        table[{action.http_method, action.path}] = action
-      end
-    end
-
-    private def dispatch(context : HTTP::Server::Context) : Nil
-      key = {context.request.method, context.request.path}
-      if action = @routes[key]?
-        action.call(context)
-      else
-        context.response.status_code = 404
+    private def gc_stats_loop : Nil
+      loop do
+        sleep GC_STATS_PERIOD.seconds
+        s = GC.stats
+        log_phase "GC.stats heap_size=#{s.heap_size} free_bytes=#{s.free_bytes} bytes_since_gc=#{s.bytes_since_gc} total=#{s.total_bytes}"
       end
     end
 
