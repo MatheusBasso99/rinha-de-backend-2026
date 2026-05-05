@@ -48,6 +48,3 @@ Thumbs.db
 
 # Local performance log — kept out of the repo, lives next to the code.
 /RESULTS.md
-
-# Local backlog — dev-loop notes only, not part of the submission.
-/TODO.md
