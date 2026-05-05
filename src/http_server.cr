@@ -1,5 +1,5 @@
 require "socket"
-require "./picohttp"
+require "./http_parser"
 require "./json_parser"
 require "./parsed_request"
 require "./vectorizer"
@@ -20,8 +20,8 @@ module RinhaDeBackend
   #   - One fiber per connection (same as stdlib).
   #   - Per-fiber 8 KB stack buffer (uninitialized StaticArray) — survives
   #     I/O yields, costs nothing to "allocate".
-  #   - picohttpparser does the request-line + headers parse in C (SIMD
-  #     where available), zero allocations.
+  #   - HttpParser (pure Crystal) parses the request line + headers from
+  #     the same stack buffer, zero allocations on the hot path.
   #   - Six pre-rendered fraud-score responses + three static
   #     status-only responses, written with a single `socket.write`.
   #   - `read_buffering = false`, `sync = true`, `tcp_nodelay = true`:
@@ -97,9 +97,9 @@ module RinhaDeBackend
 
       buf_storage = uninitialized StaticArray(UInt8, 8192)
       buf = buf_storage.to_slice
-      headers_storage = uninitialized StaticArray(LibPicoHTTP::PhrHeader, 16)
+      headers_storage = uninitialized StaticArray(HttpParser::Header, 16)
       filled = 0
-      last_len = 0_u64
+      last_len = 0
 
       loop do
         if filled >= buf.size
@@ -114,16 +114,16 @@ module RinhaDeBackend
         return if n == 0
         new_filled = filled + n
 
-        method_ptr = Pointer(LibC::Char).null
-        method_len = 0_u64
-        path_ptr = Pointer(LibC::Char).null
-        path_len = 0_u64
+        method_ptr = Pointer(UInt8).null
+        method_len = 0
+        path_ptr = Pointer(UInt8).null
+        path_len = 0
         minor = 0
-        num_headers = MAX_HEADERS.to_u64
+        num_headers = MAX_HEADERS
 
-        result = LibPicoHTTP.phr_parse_request(
-          buf.to_unsafe.as(LibC::Char*),
-          new_filled.to_u64,
+        result = HttpParser.parse_request(
+          buf.to_unsafe,
+          new_filled,
           pointerof(method_ptr),
           pointerof(method_len),
           pointerof(path_ptr),
@@ -135,10 +135,10 @@ module RinhaDeBackend
         )
 
         if result == -2
-          # Partial. Keep reading. picohttpparser uses last_len to skip
+          # Partial. Keep reading. The parser uses last_len to skip
           # already-scanned bytes on the next call.
           filled = new_filled
-          last_len = new_filled.to_u64
+          last_len = new_filled
           next
         end
 
@@ -150,7 +150,7 @@ module RinhaDeBackend
         header_end = result
         content_length, connection_close = HttpServer.scan_headers(
           headers_storage.to_unsafe,
-          num_headers.to_i32,
+          num_headers,
           minor,
         )
 
@@ -167,8 +167,8 @@ module RinhaDeBackend
           new_filled += n
         end
 
-        method_slice = Slice.new(method_ptr.as(UInt8*), method_len.to_i32)
-        path_slice = Slice.new(path_ptr.as(UInt8*), path_len.to_i32)
+        method_slice = Slice.new(method_ptr, method_len)
+        path_slice = Slice.new(path_ptr, path_len)
         body_slice = buf[header_end, content_length]
 
         dispatch(sock, method_slice, path_slice, body_slice)
@@ -184,7 +184,7 @@ module RinhaDeBackend
           buf.to_unsafe.move_from(buf.to_unsafe + total, leftover)
         end
         filled = leftover
-        last_len = 0_u64
+        last_len = 0
       end
     rescue IO::Error
       # Connection reset, timeout, peer closed mid-write — normal under
@@ -240,26 +240,26 @@ module RinhaDeBackend
     # pieces that bit us last time (Content-Length came back as 0,
     # silent wrong answer downstream).
     # ------------------------------------------------------------------
-    def self.scan_headers(headers : LibPicoHTTP::PhrHeader*, num : Int32, minor : Int32) : {Int32, Bool}
+    def self.scan_headers(headers : HttpParser::Header*, num : Int32, minor : Int32) : {Int32, Bool}
       content_length = 0
       # HTTP/1.0 default: close. HTTP/1.1 default: keep-alive.
       connection_close = minor == 0
       i = 0
       while i < num
         h = headers[i]
-        nlen = h.name_len.to_i32
+        nlen = h.name_len
         if nlen == CONTENT_LENGTH_NAME.bytesize &&
-           ci_eq(h.name.as(UInt8*), CONTENT_LENGTH_NAME.to_unsafe, nlen)
-          content_length = parse_content_length(h.value.as(UInt8*), h.value_len.to_i32)
+           ci_eq(h.name, CONTENT_LENGTH_NAME.to_unsafe, nlen)
+          content_length = parse_content_length(h.value, h.value_len)
         elsif nlen == CONNECTION_NAME.bytesize &&
-              ci_eq(h.name.as(UInt8*), CONNECTION_NAME.to_unsafe, nlen)
-          vlen = h.value_len.to_i32
-          vstart, vend = trim_ows(h.value.as(UInt8*), vlen)
+              ci_eq(h.name, CONNECTION_NAME.to_unsafe, nlen)
+          vlen = h.value_len
+          vstart, vend = trim_ows(h.value, vlen)
           if vend - vstart == CLOSE_VALUE.bytesize &&
-             ci_eq(h.value.as(UInt8*) + vstart, CLOSE_VALUE.to_unsafe, CLOSE_VALUE.bytesize)
+             ci_eq(h.value + vstart, CLOSE_VALUE.to_unsafe, CLOSE_VALUE.bytesize)
             connection_close = true
           elsif vend - vstart == KEEP_ALIVE_VALUE.bytesize &&
-                ci_eq(h.value.as(UInt8*) + vstart, KEEP_ALIVE_VALUE.to_unsafe, KEEP_ALIVE_VALUE.bytesize)
+                ci_eq(h.value + vstart, KEEP_ALIVE_VALUE.to_unsafe, KEEP_ALIVE_VALUE.bytesize)
             connection_close = false
           end
         end
@@ -268,22 +268,22 @@ module RinhaDeBackend
       {content_length, connection_close}
     end
 
-    # Parses the request envelope from `buf` using picohttpparser, then
+    # Parses the request envelope from `buf` using HttpParser, then
     # returns `{method, path, body, connection_close}` with byte slices
     # pointing into `buf`. Returns nil on partial/invalid input. Used by
     # specs to exercise the full parse path without TCP.
     def self.parse_request(buf : Bytes) : {Bytes, Bytes, Bytes, Bool}?
-      headers_storage = uninitialized StaticArray(LibPicoHTTP::PhrHeader, 16)
-      method_ptr = Pointer(LibC::Char).null
-      method_len = 0_u64
-      path_ptr = Pointer(LibC::Char).null
-      path_len = 0_u64
+      headers_storage = uninitialized StaticArray(HttpParser::Header, 16)
+      method_ptr = Pointer(UInt8).null
+      method_len = 0
+      path_ptr = Pointer(UInt8).null
+      path_len = 0
       minor = 0
-      num_headers = MAX_HEADERS.to_u64
+      num_headers = MAX_HEADERS
 
-      result = LibPicoHTTP.phr_parse_request(
-        buf.to_unsafe.as(LibC::Char*),
-        buf.size.to_u64,
+      result = HttpParser.parse_request(
+        buf.to_unsafe,
+        buf.size,
         pointerof(method_ptr),
         pointerof(method_len),
         pointerof(path_ptr),
@@ -291,21 +291,21 @@ module RinhaDeBackend
         pointerof(minor),
         headers_storage.to_unsafe,
         pointerof(num_headers),
-        0_u64,
+        0,
       )
       return nil if result < 0
 
       header_end = result
       content_length, connection_close = scan_headers(
         headers_storage.to_unsafe,
-        num_headers.to_i32,
+        num_headers,
         minor,
       )
       total = header_end + content_length
       return nil if total > buf.size
 
-      method = Slice.new(method_ptr.as(UInt8*), method_len.to_i32)
-      path = Slice.new(path_ptr.as(UInt8*), path_len.to_i32)
+      method = Slice.new(method_ptr, method_len)
+      path = Slice.new(path_ptr, path_len)
       body = buf[header_end, content_length]
       {method, path, body, connection_close}
     end
