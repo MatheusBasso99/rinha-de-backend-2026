@@ -1,2 +1,2 @@
 require "spec"
-require "../src/rinha_de_backend"
+require "../src/server"
