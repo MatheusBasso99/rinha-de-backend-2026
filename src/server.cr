@@ -1,6 +1,8 @@
 require "http/server"
 require "./mcc_risk"
 require "./vectorizer"
+require "./references"
+require "./knn"
 require "./actions/ready_action"
 require "./actions/fraud_score_action"
 
@@ -12,12 +14,21 @@ module RinhaDeBackend
     @routes : Hash(Tuple(String, String), BaseAction)
 
     def initialize(@host : String = DEFAULT_HOST, @port : Int32 = DEFAULT_PORT)
+      log_phase "loading mcc_risk"
       mcc_risk = MccRisk.new
+
+      log_phase "loading references"
+      refs = References.load
+      log_phase "loaded #{refs.count} references"
+
       vectorizer = Vectorizer.new(mcc_risk)
-      @routes = build_routes(vectorizer)
+      knn = Knn.new(refs)
+
+      @routes = build_routes(vectorizer, knn)
     end
 
     def listen : Nil
+      log_phase "listening on #{@host}:#{@port}"
       server = HTTP::Server.new do |context|
         dispatch(context)
       end
@@ -25,10 +36,10 @@ module RinhaDeBackend
       server.listen
     end
 
-    private def build_routes(vectorizer : Vectorizer) : Hash(Tuple(String, String), BaseAction)
+    private def build_routes(vectorizer : Vectorizer, knn : Knn) : Hash(Tuple(String, String), BaseAction)
       actions = [
         ReadyAction.new,
-        FraudScoreAction.new(vectorizer),
+        FraudScoreAction.new(vectorizer, knn),
       ] of BaseAction
 
       actions.each_with_object({} of Tuple(String, String) => BaseAction) do |action, table|
@@ -43,6 +54,11 @@ module RinhaDeBackend
       else
         context.response.status_code = 404
       end
+    end
+
+    private def log_phase(msg : String) : Nil
+      STDERR.puts "[server] #{Time.utc.to_rfc3339} #{msg}"
+      STDERR.flush
     end
   end
 end

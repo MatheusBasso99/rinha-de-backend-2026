@@ -2,18 +2,30 @@ require "json"
 require "./base_action"
 require "../payload"
 require "../vectorizer"
+require "../knn"
+require "../references"
 
 module RinhaDeBackend
   class FraudScoreAction < BaseAction
     route "POST", "/fraud-score"
 
-    # Safe fallback. We always return 200 with this body when anything goes
-    # wrong (parse error, runtime exception). Per docs/EVALUATION.md, an Err
-    # (HTTP != 200) costs 5x in scoring, while a wrong-but-200 answer costs 1x
-    # for FP / 3x for FN — returning the legit fallback is the cheapest panic.
-    FALLBACK_BODY = %({"approved":true,"fraud_score":0.0})
+    # Six possible outcomes (frauds_in_top_5 = 0..5). Threshold is 0.6, so
+    # 3+ frauds → not approved. Pre-rendered to avoid any String#build /
+    # Float#to_s allocations on the hot path.
+    RESPONSES = [
+      %({"approved":true,"fraud_score":0.0}),
+      %({"approved":true,"fraud_score":0.2}),
+      %({"approved":true,"fraud_score":0.4}),
+      %({"approved":false,"fraud_score":0.6}),
+      %({"approved":false,"fraud_score":0.8}),
+      %({"approved":false,"fraud_score":1.0}),
+    ]
 
-    def initialize(@vectorizer : Vectorizer)
+    # Same legit fallback used on parse / runtime errors. HTTP 200 with a
+    # legit answer is cheaper than a 5xx (Err weighs 5x in scoring).
+    FALLBACK_BODY = RESPONSES[0]
+
+    def initialize(@vectorizer : Vectorizer, @knn : Knn)
     end
 
     def call(context : HTTP::Server::Context) : Nil
@@ -21,12 +33,16 @@ module RinhaDeBackend
       return respond_json(context, 200, FALLBACK_BODY) unless body
 
       req = FraudScoreRequest.from_json(body)
-      _vec = @vectorizer.vectorize(req)
+      vec_f = @vectorizer.vectorize(req)
 
-      # KNN/decision wiring lands in the next iteration; for now we return
-      # the legit fallback to confirm the parse + vectorize path compiles
-      # and runs end-to-end.
-      respond_json(context, 200, FALLBACK_BODY)
+      # Quantize Float32 → Int16 (same scale used by References).
+      query = StaticArray(Int16, 14).new(0_i16)
+      14.times do |i|
+        query[i] = (vec_f[i] * References::SCALE.to_f32).round.to_i16
+      end
+
+      frauds = @knn.fraud_count_top_k(query)
+      respond_json(context, 200, RESPONSES.unsafe_fetch(frauds))
     rescue ex
       respond_json(context, 200, FALLBACK_BODY)
     end
