@@ -5,3 +5,7 @@
 *.dwarf
 
 .claude/settings.local.json
+
+# Large dataset — re-downloadable from the official repo. Baked into the
+# Docker image at build time via `COPY resources`.
+/resources/references.json.gz

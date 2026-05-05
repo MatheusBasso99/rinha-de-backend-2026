@@ -1,0 +1,72 @@
+# Rinha de Backend 2026 — submission topology.
+#
+# Constraints enforced here:
+#   - Network mode: bridge (host/privileged forbidden).
+#   - 1 LB + 2 API instances, simple round-robin (in nginx.conf).
+#   - Sum of all service limits: <= 1 CPU and <= 350 MB RAM.
+#       lb   : 0.10 CPU /  30 MB
+#       api1 : 0.45 CPU / 160 MB
+#       api2 : 0.45 CPU / 160 MB
+#       total: 1.00 CPU / 350 MB
+#   - App responds on localhost:9999 (published by the LB only).
+
+x-api: &api
+  image: rinha_de_backend:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+    platforms:
+      - linux/amd64
+  networks:
+    - rinha-net
+  expose:
+    - "9999"
+  healthcheck:
+    test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9999/ready"]
+    interval: 5s
+    timeout: 2s
+    retries: 20
+    start_period: 5s
+  deploy:
+    resources:
+      limits:
+        cpus: "0.45"
+        memory: "160MB"
+  restart: unless-stopped
+
+services:
+  api1:
+    <<: *api
+    container_name: rinha-api1
+    hostname: api1
+
+  api2:
+    <<: *api
+    container_name: rinha-api2
+    hostname: api2
+
+  lb:
+    image: nginx:1.27-alpine
+    container_name: rinha-lb
+    hostname: lb
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+    networks:
+      - rinha-net
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "30MB"
+    restart: unless-stopped
+
+networks:
+  rinha-net:
+    driver: bridge
