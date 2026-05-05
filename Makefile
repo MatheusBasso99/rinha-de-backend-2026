@@ -1,34 +1,22 @@
-# Build orchestration. We need picohttpparser compiled to a static .o
-# *before* `crystal build` (or `crystal spec`) runs, because src/picohttp.cr
-# uses `@[Link(ldflags: "#{__DIR__}/ext/picohttpparser/picohttpparser.o")]`
-# to embed the object directly into the final static binary.
-
-CC      ?= cc
-CFLAGS  ?= -O3 -fPIC -fno-stack-protector -DNDEBUG
-
-PICO_DIR := src/ext/picohttpparser
-PICO_OBJ := $(PICO_DIR)/picohttpparser.o
-PICO_SRC := $(PICO_DIR)/picohttpparser.c
-PICO_HDR := $(PICO_DIR)/picohttpparser.h
+# Build orchestration. The HTTP parser is now 100% Crystal
+# (`src/http_parser.cr`), so there is no extra C compilation step —
+# `crystal build` is the whole pipeline.
 
 .PHONY: all build release spec clean run
 
 all: build
 
-build: $(PICO_OBJ)
+build:
 	crystal build src/main.cr -o rinha_de_backend
 
-release: $(PICO_OBJ)
+release:
 	crystal build --release --no-debug -o rinha_de_backend src/main.cr
 
-spec: $(PICO_OBJ)
+spec:
 	crystal spec
 
 run: build
 	./rinha_de_backend
 
 clean:
-	rm -f $(PICO_OBJ) rinha_de_backend
-
-$(PICO_OBJ): $(PICO_SRC) $(PICO_HDR)
-	$(CC) $(CFLAGS) -c $(PICO_SRC) -o $(PICO_OBJ)
+	rm -f rinha_de_backend

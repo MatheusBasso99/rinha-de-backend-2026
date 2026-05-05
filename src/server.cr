@@ -35,11 +35,12 @@ module RinhaDeBackend
 
     def listen : Nil
       # Hot path is now zero-allocation: HttpServer reuses an 8 KB stack
-      # buffer per fiber, picohttpparser does the parse in C, JsonParser
-      # writes into a stack struct, response Bytes are pre-rendered
-      # constants, and IVF runs over mmapped Int16 slices outside the
-      # GC heap. Under those invariants we can drop the collector
-      # entirely and remove the last source of tail-latency variance.
+      # buffer per fiber, the pure-Crystal HttpParser does the parse in
+      # place against that buffer, JsonParser writes into a stack struct,
+      # response Bytes are pre-rendered constants, and IVF runs over
+      # mmapped Int16 slices outside the GC heap. Under those invariants
+      # we can drop the collector entirely and remove the last source of
+      # tail-latency variance.
       #
       # Safety valve: a watchdog fiber logs GC.stats every few seconds.
       # If heap_size grows monotonically here, we know an allocation
