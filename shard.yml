@@ -1,0 +1,13 @@
+name: rinha_de_backend
+version: 0.1.0
+
+authors:
+  - Matheus Basso <mfsb13@gmail.com>
+
+targets:
+  rinha_de_backend:
+    main: src/rinha_de_backend.cr
+
+crystal: '>= 1.20.0'
+
+license: MIT
