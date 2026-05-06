@@ -1,43 +1,49 @@
 # Rinha de Backend 2026 — submission topology.
 #
-# This branch contains ONLY the artifacts needed to run the official test:
-# this docker-compose.yml, nginx.conf and info.json. Source code lives on
+# This branch contains ONLY the artifacts needed to run the official
+# test: this docker-compose.yml and info.json. Source code lives on
 # the `main` branch.
 #
-# The API image is published to a public registry (linux/amd64). Replace
-# the placeholder below with your real published image before submission.
+# The image is published at ghcr.io/matheusbasso99/rinha-de-backend-2026
+# and contains TWO binaries:
+#   - /usr/local/bin/rinha_de_backend (default ENTRYPOINT) — API server
+#   - /usr/local/bin/rinha_lb         — Crystal LB (TCP→UDS round-robin)
+# Both are statically linked, linux/amd64, with `references.bin`
+# (~83 MiB) baked in so boot is just `open + mmap`.
 #
 # Constraints enforced here:
 #   - Network mode: bridge (host/privileged forbidden).
-#   - 1 LB + 2 API instances, simple round-robin (in nginx.conf).
+#   - 1 LB + 2 API instances, simple round-robin (no payload inspection).
 #   - Sum of all service limits: <= 1 CPU and <= 350 MB RAM.
-#       lb   : 0.10 CPU /  30 MB
-#       api1 : 0.45 CPU / 160 MB
-#       api2 : 0.45 CPU / 160 MB
+#       lb   : 0.10 CPU /  16 MB
+#       api1 : 0.45 CPU / 167 MB
+#       api2 : 0.45 CPU / 167 MB
 #       total: 1.00 CPU / 350 MB
 #   - App responds on localhost:9999 (published by the LB only).
+#
+# LB→API hop runs over Unix Domain Sockets via the shared `rinha-sockets`
+# volume — skips the TCP/IP stack on the loopback hop entirely.
 
 x-api: &api
-  # Public linux/amd64 image, built from the `main` branch and pushed
-  # to GHCR before the official test runs. Update the tag if you publish
-  # a new build (e.g. `:v1`, `:2026-05-05`) — `:latest` is fine for previews.
   image: ghcr.io/matheusbasso99/rinha-de-backend-2026:latest
   networks:
     - rinha-net
-  expose:
-    - "9999"
+  volumes:
+    - rinha-sockets:/sockets
   healthcheck:
-    test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9999/ready"]
+    # API binds a UDS, not TCP — `test -S` confirms the socket file is
+    # present (the API removes any stale file before bind, then creates
+    # it once it's listening, so existence == listening).
+    test: ["CMD-SHELL", "test -S /sockets/${RINHA_INSTANCE:-api}.sock"]
     interval: 2s
     timeout: 2s
     retries: 10
-    # Boot is O(open + mmap) since references.bin is baked into the image.
     start_period: 10s
   deploy:
     resources:
       limits:
         cpus: "0.45"
-        memory: "160MB"
+        memory: "167MB"
   restart: unless-stopped
 
 services:
@@ -45,16 +51,35 @@ services:
     <<: *api
     container_name: rinha-api1
     hostname: api1
+    environment:
+      RINHA_INSTANCE: api1
+      RINHA_LISTEN_UDS: /sockets/api1.sock
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /sockets/api1.sock"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 10s
 
   api2:
     <<: *api
     container_name: rinha-api2
     hostname: api2
+    environment:
+      RINHA_INSTANCE: api2
+      RINHA_LISTEN_UDS: /sockets/api2.sock
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /sockets/api2.sock"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 10s
 
   lb:
-    image: nginx:1.27-alpine
+    image: ghcr.io/matheusbasso99/rinha-de-backend-2026:latest
     container_name: rinha-lb
     hostname: lb
+    entrypoint: ["/usr/local/bin/rinha_lb"]
     depends_on:
       api1:
         condition: service_healthy
@@ -62,17 +87,29 @@ services:
         condition: service_healthy
     networks:
       - rinha-net
+    volumes:
+      - rinha-sockets:/sockets
+    environment:
+      RINHA_LB_HOST: 0.0.0.0
+      RINHA_LB_PORT: "9999"
+      RINHA_UPSTREAMS: /sockets/api1.sock,/sockets/api2.sock
+      # Parallelism = 2 matches the Mac Mini Late 2014 physical cores
+      # (Haswell-U i5-4278U, 2C/4T). The 0.10 CPU cgroup caps aggregate
+      # throughput regardless; spreading across schedulers mainly helps
+      # when one fiber is parked in epoll_wait and a sibling has work.
+      RINHA_LB_PARALLELISM: "2"
     ports:
       - "9999:9999"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
     deploy:
       resources:
         limits:
           cpus: "0.10"
-          memory: "30MB"
+          memory: "16MB"
     restart: unless-stopped
 
 networks:
   rinha-net:
     driver: bridge
+
+volumes:
+  rinha-sockets:
