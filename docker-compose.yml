@@ -1,0 +1,79 @@
+# Rinha de Backend 2026 — submission topology.
+#
+# This branch contains ONLY the artifacts needed to run the official test:
+# this docker-compose.yml, nginx.conf and info.json. Source code lives on
+# the `main` branch.
+#
+# The API image is published to a public registry (linux/amd64). Replace
+# the placeholder below with your real published image before submission.
+#
+# Constraints enforced here:
+#   - Network mode: bridge (host/privileged forbidden).
+#   - 1 LB + 2 API instances, simple round-robin (in nginx.conf).
+#   - Sum of all service limits: <= 1 CPU and <= 350 MB RAM.
+#       lb   : 0.10 CPU /  30 MB
+#       api1 : 0.45 CPU / 160 MB
+#       api2 : 0.45 CPU / 160 MB
+#       total: 1.00 CPU / 350 MB
+#   - App responds on localhost:9999 (published by the LB only).
+
+x-api: &api
+  # TODO: replace with the real public image reference (linux/amd64).
+  #   examples:
+  #     ghcr.io/<github-user>/rinha-de-backend-2026:<tag>
+  #     <dockerhub-user>/rinha-de-backend-2026:<tag>
+  image: ghcr.io/TODO-github-user/rinha-de-backend-2026:latest
+  networks:
+    - rinha-net
+  expose:
+    - "9999"
+  healthcheck:
+    test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9999/ready"]
+    interval: 2s
+    timeout: 2s
+    retries: 10
+    # Boot is O(open + mmap) since references.bin is baked into the image.
+    start_period: 10s
+  deploy:
+    resources:
+      limits:
+        cpus: "0.45"
+        memory: "160MB"
+  restart: unless-stopped
+
+services:
+  api1:
+    <<: *api
+    container_name: rinha-api1
+    hostname: api1
+
+  api2:
+    <<: *api
+    container_name: rinha-api2
+    hostname: api2
+
+  lb:
+    image: nginx:1.27-alpine
+    container_name: rinha-lb
+    hostname: lb
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+    networks:
+      - rinha-net
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "30MB"
+    restart: unless-stopped
+
+networks:
+  rinha-net:
+    driver: bridge
