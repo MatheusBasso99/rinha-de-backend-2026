@@ -18,11 +18,10 @@
 #   - App responds on localhost:9999 (published by the LB only).
 
 x-api: &api
-  # TODO: replace with the real public image reference (linux/amd64).
-  #   examples:
-  #     ghcr.io/<github-user>/rinha-de-backend-2026:<tag>
-  #     <dockerhub-user>/rinha-de-backend-2026:<tag>
-  image: ghcr.io/TODO-github-user/rinha-de-backend-2026:latest
+  # Public linux/amd64 image, built from the `main` branch and pushed
+  # to GHCR before the official test runs. Update the tag if you publish
+  # a new build (e.g. `:v1`, `:2026-05-05`) — `:latest` is fine for previews.
+  image: ghcr.io/matheusbasso99/rinha-de-backend-2026:latest
   networks:
     - rinha-net
   expose:
