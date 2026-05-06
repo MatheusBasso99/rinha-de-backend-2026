@@ -2,11 +2,15 @@
 # (`src/http_parser.cr`), so there is no extra C compilation step —
 # `crystal build` is the whole pipeline.
 #
-# Two binaries are produced:
+# Binaries:
 #   - rinha_de_backend : the API server (single-threaded hot path).
-#   - rinha_lb         : Crystal LB over Unix Domain Sockets, built
-#                        with -Dpreview_mt -Dexecution_context to
-#                        unlock Fiber::ExecutionContext::Parallel.
+#   - rinha_lb         : legacy Crystal LB over Unix Domain Sockets,
+#                        built with -Dpreview_mt -Dexecution_context to
+#                        unlock Fiber::ExecutionContext::Parallel. The
+#                        production LB is now HAProxy (see haproxy.cfg
+#                        and the `lb` service in docker-compose.yml);
+#                        this target is kept for reference / fallback
+#                        and the binary is no longer the prod entrypoint.
 
 .PHONY: all build release lb lb-release spec clean run
 

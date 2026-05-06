@@ -8,8 +8,8 @@ require "../src/ivf"
 # is whether the per-cell triangle bound and outer break are honored.
 #
 # Comparing against unpruned IVF (rather than brute-force) isolates the
-# effect of the new pruning from the pre-existing IVF-vs-brute-force gap
-# (TODO #1 documented recall@5 = 0.9966 on jittered queries).
+# effect of the cell pruning from the pre-existing IVF-vs-brute-force gap
+# (validate_recall.cr documented recall@5 = 0.9966 on jittered queries).
 #
 # Usage: crystal run --release tools/validate_pruning.cr -- [N] [SEED] [JITTER]
 

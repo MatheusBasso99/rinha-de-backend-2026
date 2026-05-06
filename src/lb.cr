@@ -1,20 +1,28 @@
 require "socket"
 
 module RinhaDeBackend
-  # Round-robin TCP→UDS load balancer. Replaces nginx for the Rinha
-  # submission. The challenge rules forbid the LB from inspecting payload
-  # or running business logic, so this is a strict bidirectional byte
+  # Legacy round-robin TCP→UDS load balancer.
+  #
+  # The production LB is now HAProxy (see `haproxy.cfg` and the `lb`
+  # service in `docker-compose.yml`). This Crystal LB is kept in the
+  # tree for reference / fallback and is still built into the runtime
+  # image as `/usr/local/bin/rinha_lb`, but no compose service invokes
+  # it by default.
+  #
+  # Behaviour (preserved as documented for the historical iteration):
+  # the challenge rules forbid the LB from inspecting payload or
+  # running business logic, so this is a strict bidirectional byte
   # copy between the client (TCP) and the picked upstream (UDS), with
   # round-robin upstream selection at connection-accept time.
   #
-  # Two wins over nginx:
+  # Original design rationale (vs. the older nginx LB):
   #
   #   1. UDS skips the TCP/IP stack on the LB→API hop entirely (no port
   #      allocation, no Nagle, no port reuse pressure under k6 storms).
-  #   2. nginx's 30 MB allowance was paying for an HTTP-aware proxy with
-  #      logging/templates/configuration parsing. Our static Crystal
+  #   2. The previous nginx allowance was paying for an HTTP-aware proxy
+  #      with logging/templates/configuration parsing. The static Crystal
   #      binary is ~3 MB and runs on tens of KB of working set per
-  #      connection.
+  #      connection. HAProxy (in `mode tcp`) keeps both wins.
   #
   # Concurrency model
   # -----------------

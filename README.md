@@ -9,9 +9,9 @@ Implementa o módulo `fraud-score`: vetoriza cada transação em **14 dimensões
 ## Stack
 
 - **Linguagem**: Crystal 1.20.0 (binário estático Alpine, `linux/amd64`)
-- **HTTP**: `TCPServer` cru + parser HTTP 100% Crystal (sem framework, sem `picohttpparser`)
-- **Busca vetorial**: índice IVF (`k=1024`, `nprobe=16`) com quantização Int16, mmap sobre `references.bin`
-- **Load balancer**: nginx 1.27 alpine (round-robin puro, sem lógica de negócio)
+- **HTTP**: `TCPServer`/`UNIXServer` cru + parser HTTP 100% Crystal (sem framework, sem `picohttpparser`)
+- **Busca vetorial**: índice IVF (`k=2048`, `base_nprobe=8`, `retry_nprobe=16`) com quantização Int16 e poda de células (triangle inequality + bbox), mmap sobre `references.bin`
+- **Load balancer**: HAProxy `lts-alpine` em `mode tcp` (round-robin puro sobre UDS, sem lógica de negócio)
 - **Topologia**: 1 LB + 2 instâncias da API, totalizando **1 CPU / 350 MB**
 
 ## Endpoints (porta 9999)
@@ -73,7 +73,7 @@ tools/               validações offline (recall, quantização, pruning)
 ## Estrutura do repositório (Rinha)
 
 - `main` — código-fonte (esta branch).
-- `submission` — apenas `docker-compose.yml` apontando para imagem pública, `nginx.conf` e `info.json`.
+- `submission` — apenas `docker-compose.yml` apontando para imagem pública, `haproxy.cfg` e `info.json`.
 
 ## Licença
 

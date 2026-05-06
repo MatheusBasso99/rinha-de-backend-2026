@@ -27,7 +27,7 @@ module RinhaDeBackend
                                       # triangle-inequality pruning.
       max_cell_radius : UInt32,       # max(cell_radius) — global outer-break bound
       bbox_min : Slice(Int16),        # k * dims; per-cell axis-aligned bounding
-                                      # box minimum per dimension. (TODO #4)
+                                      # box minimum per dimension.
       bbox_max : Slice(Int16)         # k * dims; per-cell axis-aligned bounding
                                       # box maximum per dimension.
 
@@ -120,11 +120,11 @@ module RinhaDeBackend
       # query-time check needs only one sqrt per probed cell, not one per
       # vector in the cell.
       #
-      # Same loop also computes the per-cell axis-aligned bounding box
-      # (TODO #4): bbox_min[c][j] / bbox_max[c][j] = min/max of vec[i][j]
-      # over all vectors `i` in cell `c`. Used at query time to skip a
-      # cell when the squared distance from query to its bbox already
-      # exceeds the current top-5 worst (exact pruning).
+      # Same loop also computes the per-cell axis-aligned bounding box:
+      # bbox_min[c][j] / bbox_max[c][j] = min/max of vec[i][j] over all
+      # vectors `i` in cell `c`. Used at query time to skip a cell when
+      # the squared distance from query to its bbox already exceeds the
+      # current top-5 worst (exact pruning).
       cell_radius = Slice(UInt32).new(k, 0_u32)
       bbox_min    = Slice(Int16).new(k * dims, 0_i16)
       bbox_max    = Slice(Int16).new(k * dims, 0_i16)

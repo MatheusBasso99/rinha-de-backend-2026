@@ -2,7 +2,7 @@ require "compress/gzip"
 require "json"
 require "../src/references"
 
-# TODO #2 — Quantization sanity check.
+# Int16 quantization sanity check.
 #
 # Load the original Float32 (read as Float64 by JSON::PullParser) reference
 # dataset from references.json.gz, and the Int16 quantized dataset from

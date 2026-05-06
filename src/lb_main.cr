@@ -1,7 +1,10 @@
 require "./lb"
 
-# Entry point for the Crystal LB binary. Reads the runtime config
-# from env vars so the same image can run any of (api1, api2, lb).
+# Entry point for the legacy Crystal LB binary. The production LB is
+# now HAProxy (see haproxy.cfg / docker-compose.yml); this entrypoint
+# is kept for reference / local experimentation. Reads the runtime
+# config from env vars so the same image can run any of (api1, api2,
+# rinha_lb).
 #
 #   RINHA_LB_HOST         — bind address      (default 0.0.0.0)
 #   RINHA_LB_PORT         — bind port         (default 9999)

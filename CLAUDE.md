@@ -77,32 +77,45 @@ table. Update it when behavior changes — `CLAUDE.md` is the contract.
 
 ### Search
 
-- **IVF index** (`src/ivf.cr`, `src/ivf_builder.cr`): `k = 1024` cells,
-  `nprobe = 16`, top-K = 5. Forgy init, 5 k-means iterations, fixed seed.
+- **IVF index** (`src/ivf.cr`, `src/ivf_builder.cr`): `k = 2048` cells,
+  two-phase probe with `base_nprobe = 8` and `retry_nprobe = 16`
+  (phase B only fires when the top-5 lands at the decision edge,
+  `frauds ∈ {2, 3}`), top-K = 5. Forgy init, 5 k-means iterations,
+  fixed seed.
 - **Int16 quantization**: vectors and centroids stored as `Int16` with a
   `× 10_000` scale (`src/references.cr`). Distance math is integer-domain.
-- **Triangle-inequality pruning**: per-cell pruning using the cell's
-  `max_radius` (`src/ivf.cr`), plus a global decision-aware early exit
-  (once ≥3 frauds or ≥3 legits are locked into the top-5, we can short-
-  circuit — the answer cannot flip).
+- **Cell-level pruning** (`src/ivf.cr`):
+  - **Triangle-inequality** using the cell's `cell_radius` and the
+    global `max_cell_radius` (decision-aware outer break).
+  - **Per-cell axis-aligned bounding box** (`bbox_min` / `bbox_max`):
+    tighter than triangle in high-dim corners, exact.
+  - **Decision-aware early exit**: once ≥3 frauds or ≥3 legits lock into
+    the top-5, the answer cannot flip — short-circuit the whole probe.
+- **Inner-loop chunked early exit**: per-vector L2 evaluated in 4-dim
+  chunks (4/4/4/2), partial-sum compared against the current `worst`
+  between chunks; auto-vectorisable straight-line code per chunk.
 - **No HNSW, no VP-Tree, no exact brute-force.** Recall measured offline
   via `tools/validate_recall.cr`.
 
 ### `references.bin` layout (mmap, `MAP_POPULATE`)
 
-64-byte header, then four contiguous sections — all little-endian:
+64-byte header, then six contiguous sections — all little-endian:
 
 | section | type | size |
 |---|---|---|
-| header | `"RNH3"` magic + `count u32` + `dims u32` + `k u32` + `max_cell_radius u32` + 20 B padding | 64 B |
+| header | `"RNH4"` magic + `count u32` + `dims u32` + `k u32` + `max_cell_radius u32` + 44 B padding | 64 B |
 | vectors | `count × dims × Int16` reordered by cell | ~84 MiB |
 | labels | `count × UInt8` (0=legit, 1=fraud) | ~3 MiB |
-| centroids | `k × dims × Int16` | ~28.6 KiB |
-| cell offsets | `(k + 1) × UInt32` | ~4.1 KiB |
-| cell radii | `k × UInt32` | ~4 KiB |
+| centroids | `k × dims × Int16` | ~57.3 KiB |
+| cell offsets | `(k + 1) × UInt32` | ~8.2 KiB |
+| cell radii | `k × UInt32` | ~8 KiB |
+| bbox min | `k × dims × Int16` | ~57.3 KiB |
+| bbox max | `k × dims × Int16` | ~57.3 KiB |
 
-Total: **~83 MiB**, mmaped at boot with `MAP_POPULATE` so the first
-request doesn't pay page-fault cost.
+Total: **~84 MiB**, mmaped at boot with `MAP_POPULATE` so the first
+request doesn't pay page-fault cost. `prefault!` walks one byte every
+4 KiB after `MADV_HUGEPAGE` to give khugepaged a chance to fold pages
+into 2 MiB transparent huge pages.
 
 ### HTTP
 
@@ -121,28 +134,25 @@ request doesn't pay page-fault cost.
 
 ### Load balancer
 
-- **`src/lb.cr` + `src/lb_main.cr`** — Crystal LB built from the same
-  source tree as the API, shipped as a second binary (`rinha_lb`) in
-  the same Docker image. The LB container's compose `entrypoint:`
-  override runs `rinha_lb`; the default `ENTRYPOINT` runs the API.
-- Listens on `TCP 0.0.0.0:9999`, accepts connections, picks the next
-  upstream via `Atomic(UInt32).add(1) % N`, opens a `UNIXSocket` to
-  the picked upstream, then runs **two byte-copy fibers**
-  (downstream ↔ upstream) until either side closes. Strict
-  round-robin per connection, no payload inspection.
-- Concurrency uses **`Fiber::ExecutionContext::Parallel`** (Crystal
-  1.20 stdlib, opt-in via `-Dpreview_mt -Dexecution_context`). The
-  accept loop and all forwarder fibers live in the same parallel
-  context (`name: "lb"`, default `parallelism = 2`) so they can be
-  resumed by either of two scheduler threads. The atomic round-robin
-  is required because `@i += 1` would race across schedulers.
-- LB→API hop is `UNIXSocket`, not TCP. Skips the entire TCP/IP
-  stack on the loopback hop (no port allocation, no Nagle, no port
+- **HAProxy `lts-alpine`** (`haproxy.cfg`) is the production LB. Image
+  `haproxy:lts-alpine` (3.2.x). Runs in `mode tcp` with
+  `balance roundrobin` over UDS backends — pure byte-passthrough, no
+  HTTP parsing in the LB, matching the rinha rule of "no business logic
+  in the LB".
+- Frontend: `bind *:9999` (TCP). Backend: `server api1 /sockets/api1.sock`
+  + `server api2 /sockets/api2.sock`. LB→API hop is `AF_UNIX`, skipping
+  the TCP/IP stack on the loopback (no port allocation, no Nagle, no port
   reuse pressure under k6 storms).
-- The API is **deliberately built without the MT flags** — its hot
-  path is engineered for single-threaded zero-alloc + `GC.disable`,
-  and we want to keep that invariant. Only the LB binary uses the
-  parallel execution context.
+- Tuning: `nbthread 1` (the 0.10 CPU cap throttles aggregate throughput
+  regardless of thread count), `maxconn 512`, `tune.bufsize 8192` —
+  buffer pool sized to fit inside the 16 MB cgroup envelope.
+- Runs as `user: "0:0"` in compose. The API binds its UDS with default
+  mode `0755 root:root`; the haproxy image's worker uid 99 would
+  otherwise hit `EACCES` on `connect()`. Stays inside the container.
+- The legacy Crystal LB (`src/lb.cr` + `src/lb_main.cr`, built into the
+  image as `/usr/local/bin/rinha_lb` via `-Dpreview_mt -Dexecution_context`)
+  is kept in the tree for reference but is no longer the entrypoint of the
+  `lb` service. The HAProxy migration was the LB swap iteration.
 
 ### JSON
 
@@ -174,9 +184,10 @@ request doesn't pay page-fault cost.
 - Submission = `docker-compose.yml` on the `submission` branch, public images,
   compatible with `linux/amd64`.
 - Sum of all service limits: **≤ 1 CPU and ≤ 350 MB RAM**.
-  Current split (iter 10): `lb = 0.10 / 16 MB`, `api1 = api2 = 0.45 / 167 MB`,
-  total `1.00 / 350 MB`. The 16 MB LB cap is ~2× the measured peak working
-  set under sustained c=100 load (8.19 MiB).
+  Current split: `lb = 0.10 / 16 MB` (HAProxy), `api1 = api2 = 0.45 / 167 MB`,
+  total `1.00 / 350 MB`. HAProxy peak working set under sustained k6 load
+  sits around 12 MiB — the buffer pool dominates and is the reason
+  `maxconn`/`bufsize` are tuned down (see `haproxy.cfg`).
 - Network mode `bridge`. `host` and `privileged` are forbidden.
 - App responds on `localhost:9999`.
 
@@ -310,14 +321,16 @@ trade-off must be conscious.
   `HTTP::Server`, no framework, no Channels (no inter-fiber comms needed).
 - **Tight memory (350 MB total)**: with Int16 quantization, the vectors
   cost `3M × 14 × 2 ≈ 84 MiB`; the full mmaped `references.bin` is
-  ~83 MiB. The remaining envelope absorbs Crystal runtime, nginx, and
-  per-fiber stack buffers. Stay in `Slice(Int16)`/`StaticArray` —
+  ~84 MiB (vectors + labels + centroids + cell offsets/radii + bbox).
+  The remaining envelope absorbs Crystal runtime, HAProxy, and per-fiber
+  stack buffers. Stay in `Slice(Int16)`/`StaticArray` —
   `Array(Array(Float64))` would explode the budget.
-- **Algorithm**: IVF (`k=1024`, `nprobe=16`) with Int16 quantization and
-  triangle-inequality pruning is the chosen approach; brute-force is too
-  slow, HNSW/VP-Tree were not needed once IVF + pruning hit the recall
-  target. Re-validate recall via `tools/validate_recall.cr` before
-  changing index parameters.
+- **Algorithm**: IVF (`k=2048`, `base_nprobe=8`, `retry_nprobe=16`) with
+  Int16 quantization, triangle-inequality + bbox cell pruning, and a
+  decision-aware two-phase probe is the chosen approach; brute-force is
+  too slow, HNSW/VP-Tree were not needed once IVF + pruning hit the
+  recall target. Re-validate recall via `tools/validate_recall.cr`
+  before changing index parameters.
 - **HTTP/JSON**: custom Crystal parsers (`src/http_parser.cr`,
   `src/json_parser.cr`). Do not reintroduce stdlib `HTTP::Server` or
   `JSON::PullParser` on the hot path — both allocate per-request.

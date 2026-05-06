@@ -15,14 +15,14 @@ module RinhaDeBackend
   #
   # Three cell-level early-exits are applied between cells:
   #
-  #   a. **Triangle-inequality pruning** (TODO #2). For each probed cell
+  #   a. **Triangle-inequality pruning.** For each probed cell
   #      `c` with centroid distance `D_c = sqrt(centroid_dist_sq[c])` and
   #      precomputed radius `R_c` (max distance from centroid to any
   #      vector in `c`), no vector in cell `c` can beat the current top-5
   #      worst distance `W` if `(D_c - R_c)² >= W` (and `D_c > R_c`).
   #      Skip the whole cell.
   #
-  #   b. **Per-cell bounding-box pruning** (TODO #4). Tighter than (a) in
+  #   b. **Per-cell bounding-box pruning.** Tighter than (a) in
   #      high-dim corners. For each probed cell `c` with bbox
   #      `[bbox_min[c], bbox_max[c]]`, the minimum possible squared
   #      distance from `query` to any vector in the box is
@@ -34,7 +34,7 @@ module RinhaDeBackend
   #      with `R_max = max_cell_radius`, no remaining cell can possibly
   #      displace the current top-5. The fraud count is locked — break.
   #
-  # Inside the per-vector L2 inner loop, a chunked early-exit (TODO #3)
+  # Inside the per-vector L2 inner loop, a chunked early-exit
   # checks the partial sum only after dims 4, 8, and 12 (instead of every
   # dim). This lets LLVM auto-vectorize / instruction-schedule each
   # 4-dim chunk without a per-iteration branch breaking the
@@ -48,7 +48,6 @@ module RinhaDeBackend
 
     # Empirically discriminative dim order: high-variance dims first so the
     # partial-sum early-exit (`break if d >= worst`) hits the bound sooner.
-    # (TODO #2; mirrors the layout the 1st-place C entry uses.)
     DIM_ORDER = StaticArray[5, 6, 2, 0, 7, 8, 11, 12, 9, 10, 1, 13, 3, 4]
 
     def initialize(@refs : References,
@@ -65,7 +64,7 @@ module RinhaDeBackend
     getter base_nprobe : Int32
     getter retry_nprobe : Int32
 
-    # Two-phase IVF probe (TODO #6):
+    # Two-phase IVF probe:
     #
     #   Phase A — scan the `base_nprobe` (8) nearest cells. Run the full
     #             pruning stack (per-cell triangle, per-cell bbox,
@@ -155,7 +154,7 @@ module RinhaDeBackend
       worst = Int64::MAX
 
       # Hoist DIM_ORDER indices once for the entire query — the inner
-      # chunked loop has no order_ptr[] indirection at all. (TODO #2/#3)
+      # chunked loop has no order_ptr[] indirection at all.
       o0  = order_ptr[0];  o1  = order_ptr[1];  o2  = order_ptr[2];  o3  = order_ptr[3]
       o4  = order_ptr[4];  o5  = order_ptr[5];  o6  = order_ptr[6];  o7  = order_ptr[7]
       o8  = order_ptr[8];  o9  = order_ptr[9];  o10 = order_ptr[10]; o11 = order_ptr[11]
@@ -185,7 +184,7 @@ module RinhaDeBackend
             end
           end
 
-          # (b) Per-cell bounding-box exact skip (TODO #4). Min squared
+          # (b) Per-cell bounding-box exact skip. Min squared
           # distance from `query` to the axis-aligned bbox of this cell.
           bb_off = cell &* dims
           bb_d = 0_i64
@@ -218,7 +217,7 @@ module RinhaDeBackend
             off = i &* dims
             d = 0_i64
 
-            # Chunk 0 (dims order[0..3]). (TODO #3)
+            # Chunk 0 (dims order[0..3]).
             df = query_ptr[o0].to_i32 &- vec_ptr[off &+ o0].to_i32
             d &+= (df &* df).to_i64
             df = query_ptr[o1].to_i32 &- vec_ptr[off &+ o1].to_i32
@@ -301,7 +300,7 @@ module RinhaDeBackend
           kk &+= 1
         end
 
-        # Boundary retry only on the decision edge (TODO #6). The fixed
+        # Boundary retry only on the decision edge. The fixed
         # threshold is 0.6 → frauds < 3 ⇒ approve. Top-5 with frauds in
         # {2, 3} is the "one neighbor away from flipping" zone, where the
         # extra 16 cells can move the answer; outside that zone, the

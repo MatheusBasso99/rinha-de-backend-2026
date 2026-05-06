@@ -4,10 +4,13 @@
 #
 # Three artifacts are produced here:
 #   - rinha_de_backend : the API HTTP server (runtime).
-#   - rinha_lb         : Crystal LB that replaces nginx. TCP 9999 → UDS,
-#                        round-robin across the two API instances. Built
-#                        with -Dpreview_mt -Dexecution_context to enable
-#                        Fiber::ExecutionContext::Parallel.
+#   - rinha_lb         : legacy Crystal LB. TCP 9999 → UDS, round-robin
+#                        across the two API instances. Built with
+#                        -Dpreview_mt -Dexecution_context to enable
+#                        Fiber::ExecutionContext::Parallel. Kept for
+#                        reference / fallback; the prod `lb` service
+#                        in docker-compose.yml now runs HAProxy and
+#                        does not invoke this binary.
 #   - preprocess       : converts references.json.gz into the binary format
 #                        consumed via mmap at runtime. Run once during the
 #                        build; the resulting .bin ships with the runtime
@@ -49,11 +52,13 @@ RUN crystal build \
     src/main.cr \
  && strip /build/rinha_de_backend
 
-# The LB needs preview_mt + execution_context (gates
-# Fiber::ExecutionContext::Parallel in stdlib). The API is
+# Legacy Crystal LB binary. Needs preview_mt + execution_context
+# (gates Fiber::ExecutionContext::Parallel in stdlib). The API is
 # deliberately built without those flags — its hot path is engineered
 # for single-threaded zero-alloc, and we want to keep the GC.disable
-# strategy unchanged.
+# strategy unchanged. The prod LB is HAProxy (see compose); this
+# binary is shipped for parity with older compose files that may
+# still reference it as the lb entrypoint.
 RUN crystal build \
     --release \
     --no-debug \
@@ -100,6 +105,7 @@ COPY --from=build /build/rinha_lb                    /usr/local/bin/rinha_lb
 
 EXPOSE 9999
 
-# Default entrypoint is the API; the LB container in docker-compose
-# overrides this to /usr/local/bin/rinha_lb.
+# Default entrypoint is the API. The LB service in docker-compose
+# uses the haproxy:lts-alpine image directly, not this image, so this
+# entrypoint is only ever exercised by the api1/api2 containers.
 ENTRYPOINT ["/usr/local/bin/rinha_de_backend"]

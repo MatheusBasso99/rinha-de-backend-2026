@@ -74,9 +74,10 @@ module RinhaDeBackend
 
     # Either listen on TCP (host/port) or on a Unix Domain Socket path.
     # UDS mode is selected by passing a non-nil `uds_path`; in that mode
-    # `host`/`port` are ignored. The Crystal LB (`src/lb.cr`) talks to
-    # the API exclusively over UDS — TCP mode is kept as the dev/local
-    # path and so specs/tools that don't go through the LB still work.
+    # `host`/`port` are ignored. The prod LB (HAProxy, see haproxy.cfg)
+    # talks to the API exclusively over UDS — TCP mode is kept as the
+    # dev/local path so specs/tools that don't go through the LB still
+    # work.
     def initialize(@host : String, @port : Int32, @vectorizer : Vectorizer, @ivf : Ivf, @uds_path : String? = nil)
     end
 

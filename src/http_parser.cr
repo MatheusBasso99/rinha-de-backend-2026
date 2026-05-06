@@ -8,19 +8,21 @@ module RinhaDeBackend
   #   - kills the FFI surface and the cc step in the build,
   #   - the SSE4.2 fast paths in upstream picohttpparser amortize over
   #     long URIs and long header values; the Rinha workload sees
-  #     `/fraud-score` (12 B) and ~10 short headers from nginx,
-  #   - we trust nginx to produce syntactically-valid bytes, so we can
-  #     skip the per-byte tchar / CTL / DEL validation upstream
-  #     picohttpparser does and just locate the structural delimiters
-  #     (`:`, SP, CR, LF) via libc `memchr`. Glibc/musl memchr is
-  #     heavily SIMD-tuned (SSE4.2 / AVX2 on x86_64), winning on every
-  #     input length we care about.
+  #     `/fraud-score` (12 B) and ~10 short headers from the k6 client,
+  #   - we trust the rinha test harness to produce syntactically-valid
+  #     bytes (the prod LB is HAProxy in `mode tcp`, byte-passthrough,
+  #     so the parser sees client bytes verbatim), so we skip the
+  #     per-byte tchar / CTL / DEL validation upstream picohttpparser
+  #     does and just locate the structural delimiters (`:`, SP, CR, LF)
+  #     via libc `memchr`. Glibc/musl memchr is heavily SIMD-tuned
+  #     (SSE4.2 / AVX2 on x86_64), winning on every input length we
+  #     care about.
   #
   # Out of scope vs upstream (we never exercise these in this server):
   #   - response parsing (we never act as an HTTP client),
-  #   - chunked transfer decoding (nginx unchunks for us upstream),
-  #   - obs-fold / multi-line header continuation (RFC 7230 obsoleted it
-  #     and nginx normalises it before we ever see the bytes).
+  #   - chunked transfer decoding (k6 always sends Content-Length),
+  #   - obs-fold / multi-line header continuation (RFC 7230 obsoleted
+  #     it and well-formed clients don't emit it).
   #
   # Trust assumptions (i.e. things this parser does NOT detect):
   #   - non-token bytes inside a header name,
@@ -174,8 +176,8 @@ module RinhaDeBackend
       end
       return {Pointer(UInt8).null, -2} if buf >= buf_end
 
-      # PATH: scan to the next SP. Trusts that nginx never embeds CTLs
-      # in the request target.
+      # PATH: scan to the next SP. Trusts that the harness client never
+      # embeds CTLs in the request target.
       remaining = (buf_end.address - buf.address).to_i32
       sp = memchr(buf, SP, remaining)
       return {Pointer(UInt8).null, -2} if sp.null?
@@ -221,9 +223,10 @@ module RinhaDeBackend
     end
 
     # Parses the header block: (name ":" OWS value OWS CRLF)* CRLF.
-    # Trims trailing OWS from each value. Trusts nginx's syntactic
-    # output: per-byte tchar / CTL validation is omitted, we only locate
-    # the structural delimiters via libc memchr (SIMD-vectorised).
+    # Trims trailing OWS from each value. Trusts the harness client's
+    # syntactic output: per-byte tchar / CTL validation is omitted, we
+    # only locate the structural delimiters via libc memchr (SIMD-
+    # vectorised).
     private def self.parse_headers(buf : UInt8*, buf_end : UInt8*,
                                    headers : Pointer(Header),
                                    num_headers : Pointer(Int32),
@@ -259,8 +262,9 @@ module RinhaDeBackend
           buf += 1
         end
 
-        # Value: scan to CR (the line terminator). nginx always sends
-        # CRLF; bare LF would be detected here as "no CR" → partial.
+        # Value: scan to CR (the line terminator). The harness client
+        # always sends CRLF; bare LF would be detected here as
+        # "no CR" → partial.
         remaining = (buf_end.address - buf.address).to_i32
         cr = memchr(buf, CR, remaining)
         return {Pointer(UInt8).null, -2} if cr.null?

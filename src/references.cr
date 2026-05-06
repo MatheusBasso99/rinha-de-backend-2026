@@ -28,7 +28,7 @@ module RinhaDeBackend
   #   - `bbox_max`    : Slice(Int16), length = k * DIMS. Per-cell axis-
   #                     aligned bounding box maximum per dimension.
   #                     Used at query time for an exact cell-pruning
-  #                     check tighter than triangle-inequality (TODO #4).
+  #                     check tighter than triangle-inequality.
   #
   # Floats are quantized as `(v * 10_000).round.to_i16`. The `-1`
   # sentinel for indices 5/6 (no last_transaction) maps to `-10_000`,
@@ -78,7 +78,7 @@ module RinhaDeBackend
     # Base + size of the mmapped region (set only on the mmap path; nil for
     # non-mmap loaders). Used by `prefault!` to walk the region and force
     # pages into the page cache, optionally promoted to 2 MiB transparent
-    # huge pages where the kernel allows. (TODO #5)
+    # huge pages where the kernel allows.
     @mmap_base : UInt8* = Pointer(UInt8).null
     @mmap_size : Int64  = 0_i64
 
@@ -119,7 +119,7 @@ module RinhaDeBackend
       LibC.close(fd)
       raise "mmap(#{path}) failed: errno=#{Errno.value}" if ptr == LibC::MAP_FAILED
 
-      # TODO #5: hint the kernel to back the region with 2 MiB transparent
+      # Hint the kernel to back the region with 2 MiB transparent
       # huge pages. Best-effort — the kernel may decline (depends on THP
       # policy and filesystem support for file-backed THP). The actual
       # touch loop lives in `prefault!`, called during warm-up.
@@ -170,7 +170,7 @@ module RinhaDeBackend
     # give MADV_HUGEPAGE an opportunity to fold them into 2 MiB pages).
     # MAP_POPULATE already prefaults at mmap time, but a manual touch
     # post-madvise is the canonical way to nudge khugepaged into action
-    # on file-backed mappings. (TODO #5)
+    # on file-backed mappings.
     #
     # No-op on non-mmap loads (`load`, `load_from_io`).
     def prefault! : Nil

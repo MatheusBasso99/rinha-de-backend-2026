@@ -1,6 +1,6 @@
 require "../src/references"
 
-# TODO #1 — Validate IVF recall vs brute-force.
+# Validate IVF recall vs brute-force.
 #
 # Samples N vectors from the mmapped references.bin, computes brute-force
 # top-5 (over the full 3M Int16 dataset) and IVF top-5 (with nprobe=16),
@@ -153,7 +153,7 @@ module RinhaDeBackend
 
   # ----- Main -----
   # `noise` (env JITTER, default 0) adds Int16 jitter in [-jitter..+jitter] to
-  # each query dimension. 0 = exact in-set queries (TODO baseline). Try a few
+  # each query dimension. 0 = exact in-set queries (baseline). Try a few
   # 100-300 values to simulate realistic /fraud-score traffic that does not
   # land on a known data point.
   jitter = (ENV["JITTER"]? || "0").to_i

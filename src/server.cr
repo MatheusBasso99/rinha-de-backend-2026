@@ -26,7 +26,7 @@ module RinhaDeBackend
       refs = References.mmap
       log_phase "mmapped #{refs.count} references"
 
-      # TODO #5: post-madvise warm-up touch. Brings every 4 KiB page into
+      # Post-madvise warm-up touch. Brings every 4 KiB page into
       # residence and gives khugepaged an opportunity to fold them into
       # 2 MiB transparent huge pages, cutting TLB pressure during cold
       # cluster scans (the dominant tail cause).
@@ -39,8 +39,9 @@ module RinhaDeBackend
       log_phase "ivf ready: k=#{refs.k} base_nprobe=#{ivf.base_nprobe} retry_nprobe=#{ivf.retry_nprobe}"
 
       # When RINHA_LISTEN_UDS is set the API binds the matching Unix
-      # Domain Socket and the Crystal LB (`src/lb.cr`) is the only thing
-      # talking to it. Empty/unset = TCP fallback (dev + spec runs).
+      # Domain Socket and the LB (HAProxy in prod, see haproxy.cfg) is
+      # the only thing talking to it. Empty/unset = TCP fallback
+      # (dev + spec runs).
       uds_path = ENV["RINHA_LISTEN_UDS"]?.try { |s| s.empty? ? nil : s }
       @http = HttpServer.new(@host, @port, vectorizer, ivf, uds_path)
     end
