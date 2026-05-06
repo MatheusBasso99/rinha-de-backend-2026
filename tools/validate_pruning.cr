@@ -15,21 +15,29 @@ require "../src/ivf"
 
 module RinhaDeBackend
   REFS    = References.mmap
-  IVF     = Ivf.new(REFS, nprobe: Ivf::DEFAULT_NPROBE)
+  IVF     = Ivf.new(REFS)
   N_QUERY = (ARGV[0]? || "200").to_i
   SEED    = (ARGV[1]? || "1337").to_u64
   JITTER  = (ARGV[2]? || "0").to_i
   K       = 5
 
-  # Unpruned reference: identical structure to src/ivf.cr but without the
-  # triangle-inequality skip and without the max_cell_radius outer break.
+  BASE_NPROBE  = Ivf::DEFAULT_BASE_NPROBE
+  RETRY_NPROBE = Ivf::DEFAULT_RETRY_NPROBE
+
+  # Unpruned reference: identical phase / boundary-retry structure as
+  # `Ivf#fraud_count_top_k`, but without the per-cell triangle-inequality
+  # skip, without the per-cell bbox skip, and without the decision-aware
+  # outer break. Comparing pruned vs unpruned with the same retry policy
+  # isolates the effect of the cell-pruning skips from the retry logic.
   def self.fraud_count_unpruned(query : StaticArray(Int16, 14)) : Int32
     vectors      = REFS.vectors
     labels       = REFS.labels
     centroids    = REFS.centroids
     cell_offsets = REFS.cell_offsets
     k            = REFS.k
-    nprobe       = Ivf::DEFAULT_NPROBE
+    base_nprobe  = BASE_NPROBE
+    retry_nprobe = RETRY_NPROBE
+    total_nprobe = base_nprobe + retry_nprobe
     dims         = References::DIMS
 
     vec_ptr   = vectors.to_unsafe
@@ -53,7 +61,7 @@ module RinhaDeBackend
       end
 
       if d < worst_probe
-        slot = nprobe &- 1
+        slot = total_nprobe &- 1
         while slot > 0 && probe_dist[slot &- 1] > d
           probe_dist[slot] = probe_dist[slot &- 1]
           probe_cell[slot] = probe_cell[slot &- 1]
@@ -61,7 +69,7 @@ module RinhaDeBackend
         end
         probe_dist[slot] = d
         probe_cell[slot] = c
-        worst_probe = probe_dist[nprobe &- 1]
+        worst_probe = probe_dist[total_nprobe &- 1]
       end
 
       c &+= 1
@@ -71,40 +79,60 @@ module RinhaDeBackend
     best_label = StaticArray(UInt8, 5).new(0_u8)
     worst = Int64::MAX
 
-    p = 0
-    while p < nprobe
-      cell  = probe_cell[p]
-      start = cell_offsets[cell].to_i32
-      stop  = cell_offsets[cell &+ 1].to_i32
+    probe_start = 0
+    probe_end   = base_nprobe
+    phase = 0
 
-      i = start
-      while i < stop
-        off = i * dims
-        d = 0_i64
-        j = 0
-        while j < dims
-          diff = query_ptr[j].to_i32 - vec_ptr[off + j].to_i32
-          d &+= (diff &* diff).to_i64
-          break if d >= worst
-          j &+= 1
-        end
+    while true
+      p = probe_start
+      while p < probe_end
+        cell  = probe_cell[p]
+        start = cell_offsets[cell].to_i32
+        stop  = cell_offsets[cell &+ 1].to_i32
 
-        if d < worst
-          slot = K &- 1
-          while slot > 0 && best_dist[slot &- 1] > d
-            best_dist[slot]  = best_dist[slot &- 1]
-            best_label[slot] = best_label[slot &- 1]
-            slot &-= 1
+        i = start
+        while i < stop
+          off = i * dims
+          d = 0_i64
+          j = 0
+          while j < dims
+            diff = query_ptr[j].to_i32 - vec_ptr[off + j].to_i32
+            d &+= (diff &* diff).to_i64
+            break if d >= worst
+            j &+= 1
           end
-          best_dist[slot]  = d
-          best_label[slot] = lab_ptr[i]
-          worst = best_dist[K &- 1]
+
+          if d < worst
+            slot = K &- 1
+            while slot > 0 && best_dist[slot &- 1] > d
+              best_dist[slot]  = best_dist[slot &- 1]
+              best_label[slot] = best_label[slot &- 1]
+              slot &-= 1
+            end
+            best_dist[slot]  = d
+            best_label[slot] = lab_ptr[i]
+            worst = best_dist[K &- 1]
+          end
+
+          i &+= 1
         end
 
-        i &+= 1
+        p &+= 1
       end
 
-      p &+= 1
+      break if phase == 1 || retry_nprobe == 0
+
+      frauds_now = 0
+      kk = 0
+      while kk < K
+        frauds_now &+= 1 if best_label[kk] == References::LABEL_FRAUD
+        kk &+= 1
+      end
+
+      break unless frauds_now == 2 || frauds_now == 3
+      probe_start = base_nprobe
+      probe_end   = total_nprobe
+      phase = 1
     end
 
     frauds = 0
@@ -116,7 +144,7 @@ module RinhaDeBackend
     frauds
   end
 
-  STDERR.puts "[prune] count=#{REFS.count} k=#{REFS.k} max_cell_radius=#{REFS.max_cell_radius} samples=#{N_QUERY} seed=#{SEED} jitter=#{JITTER}"
+  STDERR.puts "[prune] count=#{REFS.count} k=#{REFS.k} max_cell_radius=#{REFS.max_cell_radius} base=#{BASE_NPROBE} retry=#{RETRY_NPROBE} samples=#{N_QUERY} seed=#{SEED} jitter=#{JITTER}"
   STDERR.flush
 
   rng = Random.new(SEED)

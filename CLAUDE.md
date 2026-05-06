@@ -106,16 +106,43 @@ request doesn't pay page-fault cost.
 
 ### HTTP
 
-- **`TCPServer` raw**, no `HTTP::Server`, no framework
+- **`TCPServer` raw** (or **`UNIXServer`** when `RINHA_LISTEN_UDS` is
+  set — the LB→API hop runs over UDS), no `HTTP::Server`, no framework
   (`src/http_server.cr`). One fiber per connection (`spawn handle`).
 - **HTTP parser 100% Crystal** (`src/http_parser.cr`) — `picohttpparser`
   was removed; there is no C dependency anymore.
 - **Keep-alive** by default (HTTP/1.1); only `Connection: close` triggers
-  shutdown. `TCP_NODELAY=true`, `sync=true`, `read_buffering=false`.
+  shutdown. On TCP: `TCP_NODELAY=true`, `sync=true`, `read_buffering=false`.
+  On UDS: `sync=true`, `read_buffering=false` (no Nagle).
 - **Stack-allocated 8 KiB read buffer** per fiber, reused across
   requests on the same connection.
 - **Pre-rendered responses**: the 6 possible `{approved, fraud_score}`
   bodies (`0.0/0.2/0.4/0.6/0.8/1.0`) are precomputed slices.
+
+### Load balancer
+
+- **`src/lb.cr` + `src/lb_main.cr`** — Crystal LB built from the same
+  source tree as the API, shipped as a second binary (`rinha_lb`) in
+  the same Docker image. The LB container's compose `entrypoint:`
+  override runs `rinha_lb`; the default `ENTRYPOINT` runs the API.
+- Listens on `TCP 0.0.0.0:9999`, accepts connections, picks the next
+  upstream via `Atomic(UInt32).add(1) % N`, opens a `UNIXSocket` to
+  the picked upstream, then runs **two byte-copy fibers**
+  (downstream ↔ upstream) until either side closes. Strict
+  round-robin per connection, no payload inspection.
+- Concurrency uses **`Fiber::ExecutionContext::Parallel`** (Crystal
+  1.20 stdlib, opt-in via `-Dpreview_mt -Dexecution_context`). The
+  accept loop and all forwarder fibers live in the same parallel
+  context (`name: "lb"`, default `parallelism = 2`) so they can be
+  resumed by either of two scheduler threads. The atomic round-robin
+  is required because `@i += 1` would race across schedulers.
+- LB→API hop is `UNIXSocket`, not TCP. Skips the entire TCP/IP
+  stack on the loopback hop (no port allocation, no Nagle, no port
+  reuse pressure under k6 storms).
+- The API is **deliberately built without the MT flags** — its hot
+  path is engineered for single-threaded zero-alloc + `GC.disable`,
+  and we want to keep that invariant. Only the LB binary uses the
+  parallel execution context.
 
 ### JSON
 
@@ -147,6 +174,9 @@ request doesn't pay page-fault cost.
 - Submission = `docker-compose.yml` on the `submission` branch, public images,
   compatible with `linux/amd64`.
 - Sum of all service limits: **≤ 1 CPU and ≤ 350 MB RAM**.
+  Current split (iter 10): `lb = 0.10 / 16 MB`, `api1 = api2 = 0.45 / 167 MB`,
+  total `1.00 / 350 MB`. The 16 MB LB cap is ~2× the measured peak working
+  set under sustained c=100 load (8.19 MiB).
 - Network mode `bridge`. `host` and `privileged` are forbidden.
 - App responds on `localhost:9999`.
 
@@ -183,7 +213,28 @@ Implications:
 
 ## Official test environment
 
-Mac Mini Late 2014, 2.6 GHz, 8 GB RAM, Ubuntu 24.04 (`linux/amd64`).
+- **Hardware**: Mac Mini Late 2014, 2.6 GHz model. The 2.6 GHz Mac Mini
+  Late 2014 ships with the **Intel Core i5-4278U** (Haswell-U,
+  4th-gen Core, 2 cores / 4 threads, 2.6 GHz base / 3.1 GHz turbo,
+  TDP 28 W).
+- **Caches**: L1 32 KiB I + 32 KiB D per core, L2 256 KiB per core,
+  **L3 only 3 MiB shared** — `references.bin` (~83 MiB) thrashes
+  L3 on every per-cell scan, so the workload is memory-bound on
+  this CPU even when it isn't on a modern desktop.
+- **ISA**: SSE 4.2, AVX, **AVX2, FMA3, BMI1/BMI2**, AES, CLMUL.
+  `--mcpu=haswell` is the exact codegen target — pass it to
+  `crystal build --release` so LLVM enables AVX2/FMA and schedules
+  for Haswell's port layout.
+- **Memory**: 8 GB DDR3L-1600.
+- **OS**: Ubuntu 24.04, `linux/amd64`.
+
+Implications for benchmarking on a modern dev box (e.g. Raptor Lake
+i5/i7): bench numbers don't transfer 1:1. Modern OOO machines hide
+extra loads (e.g. a `DIM_ORDER` indirection) and have stronger branch
+predictors, so micro-optimisations that look neutral or negative
+locally can land positively on Haswell-U — and vice versa. The only
+definitive measurement is `rinha/test`. See `RESULTS.md` iter 7 for
+a worked example of this gap.
 
 ## Garbage Collector strategy
 

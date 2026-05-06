@@ -2,8 +2,12 @@
 # -----------------------------------------------------------------------------
 # Build stage: Crystal 1.20.0 on Alpine, statically linked binaries for amd64.
 #
-# Two artifacts are produced here:
-#   - rinha_de_backend : the HTTP server (runtime).
+# Three artifacts are produced here:
+#   - rinha_de_backend : the API HTTP server (runtime).
+#   - rinha_lb         : Crystal LB that replaces nginx. TCP 9999 → UDS,
+#                        round-robin across the two API instances. Built
+#                        with -Dpreview_mt -Dexecution_context to enable
+#                        Fiber::ExecutionContext::Parallel.
 #   - preprocess       : converts references.json.gz into the binary format
 #                        consumed via mmap at runtime. Run once during the
 #                        build; the resulting .bin ships with the runtime
@@ -40,9 +44,26 @@ RUN crystal build \
     --release \
     --no-debug \
     --static \
+    --mcpu=haswell \
     -o /build/rinha_de_backend \
     src/main.cr \
  && strip /build/rinha_de_backend
+
+# The LB needs preview_mt + execution_context (gates
+# Fiber::ExecutionContext::Parallel in stdlib). The API is
+# deliberately built without those flags — its hot path is engineered
+# for single-threaded zero-alloc, and we want to keep the GC.disable
+# strategy unchanged.
+RUN crystal build \
+    --release \
+    --no-debug \
+    --static \
+    --mcpu=haswell \
+    -Dpreview_mt \
+    -Dexecution_context \
+    -o /build/rinha_lb \
+    src/lb_main.cr \
+ && strip /build/rinha_lb
 
 # Build the preprocess CLI and run it — but only if the build context
 # didn't already ship a `references.bin`. The k-means step takes a few
@@ -75,7 +96,10 @@ COPY --from=build /build/resources/references.bin    ./resources/references.bin
 COPY --from=build /build/resources/normalization.json ./resources/normalization.json
 COPY --from=build /build/resources/mcc_risk.json     ./resources/mcc_risk.json
 COPY --from=build /build/rinha_de_backend            /usr/local/bin/rinha_de_backend
+COPY --from=build /build/rinha_lb                    /usr/local/bin/rinha_lb
 
 EXPOSE 9999
 
+# Default entrypoint is the API; the LB container in docker-compose
+# overrides this to /usr/local/bin/rinha_lb.
 ENTRYPOINT ["/usr/local/bin/rinha_de_backend"]

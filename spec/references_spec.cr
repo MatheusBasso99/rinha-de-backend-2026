@@ -65,7 +65,8 @@ describe RinhaDeBackend::References do
 
       refs = RinhaDeBackend::References.mmap(bin_path)
       knn = RinhaDeBackend::Knn.new(refs)
-      ivf = RinhaDeBackend::Ivf.new(refs, nprobe: 4) # nprobe == k → exact
+      # base_nprobe == k → exact (every cell scanned in phase A; no retry).
+      ivf = RinhaDeBackend::Ivf.new(refs, base_nprobe: 4, retry_nprobe: 0)
 
       refs.count.times do |i|
         query = StaticArray(Int16, 14).new(0_i16)

@@ -5,8 +5,9 @@
 *.dwarf
 shard.override.yml
 
-# Local release binary (built by `make build` / `make release`).
+# Local release binaries (built by `make build` / `make release` / `make lb`).
 /rinha_de_backend
+/rinha_lb
 
 # Compiled vendored C objects (Makefile + Dockerfile rebuild on demand).
 *.o
@@ -48,3 +49,6 @@ Thumbs.db
 
 # Local performance log — kept out of the repo, lives next to the code.
 /RESULTS.md
+
+# Local backlog/notes — kept out of the repo.
+/TODO.md

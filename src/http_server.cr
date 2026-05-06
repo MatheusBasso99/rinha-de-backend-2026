@@ -33,8 +33,8 @@ module RinhaDeBackend
     DEFAULT_PORT = 9999
 
     # 8 KB is overkill for the Rinha schema (request bodies fit in <1 KB,
-    # request lines + headers from nginx fit in ~600 B). Headroom is cheap
-    # since the buffer is on the fiber stack.
+    # request lines + headers fit in ~600 B). Headroom is cheap since the
+    # buffer is on the fiber stack.
     BUF_SIZE    = 8192
     MAX_HEADERS = 16
 
@@ -72,16 +72,44 @@ module RinhaDeBackend
     GET_PATH_READY  = "/ready".to_slice
     POST_PATH_FRAUD = "/fraud-score".to_slice
 
-    def initialize(@host : String, @port : Int32, @vectorizer : Vectorizer, @ivf : Ivf)
+    # Either listen on TCP (host/port) or on a Unix Domain Socket path.
+    # UDS mode is selected by passing a non-nil `uds_path`; in that mode
+    # `host`/`port` are ignored. The Crystal LB (`src/lb.cr`) talks to
+    # the API exclusively over UDS — TCP mode is kept as the dev/local
+    # path and so specs/tools that don't go through the LB still work.
+    def initialize(@host : String, @port : Int32, @vectorizer : Vectorizer, @ivf : Ivf, @uds_path : String? = nil)
     end
 
     def listen : Nil
-      tcp = TCPServer.new(@host, @port, reuse_port: false)
-      tcp.reuse_address = true
-      log "listening on #{@host}:#{@port}"
+      if path = @uds_path
+        # UNIXServer auto-deletes any leftover socket file before bind
+        # (Crystal stdlib guarantee), so unclean LB restarts don't wedge
+        # us with EADDRINUSE.
+        uds = UNIXServer.new(path)
+        log "listening on uds=#{path}"
+        accept_loop(uds)
+      else
+        tcp = TCPServer.new(@host, @port, reuse_port: false)
+        tcp.reuse_address = true
+        log "listening on #{@host}:#{@port}"
+        accept_loop(tcp)
+      end
+    end
 
+    # Two overloads: the concrete-typed `accept` returns the matching
+    # concrete socket (TCPSocket / UNIXSocket), so dispatch into
+    # `handle(Socket)` is monomorphic per call site — no boxing through
+    # the Socket::Server `accept : IO` signature.
+    private def accept_loop(server : TCPServer) : Nil
       loop do
-        sock = tcp.accept
+        sock = server.accept
+        spawn handle(sock)
+      end
+    end
+
+    private def accept_loop(server : UNIXServer) : Nil
+      loop do
+        sock = server.accept
         spawn handle(sock)
       end
     end
@@ -89,11 +117,14 @@ module RinhaDeBackend
     # ------------------------------------------------------------------
     # Per-connection loop. Stays alive across keep-alive requests; the
     # 8 KB stack buffer is reused for every request on the same fiber.
+    # Accepts both TCPSocket and UNIXSocket via the common `Socket`
+    # superclass. Nagle is only meaningful on TCP, so we gate the
+    # `tcp_nodelay=` call on the runtime type.
     # ------------------------------------------------------------------
-    private def handle(sock : TCPSocket) : Nil
+    private def handle(sock : Socket) : Nil
       sock.read_buffering = false
       sock.sync = true
-      sock.tcp_nodelay = true
+      sock.tcp_nodelay = true if sock.is_a?(TCPSocket)
 
       buf_storage = uninitialized StaticArray(UInt8, 8192)
       buf = buf_storage.to_slice
@@ -176,9 +207,10 @@ module RinhaDeBackend
         return if connection_close
 
         # Carry leftover bytes (start of the next pipelined request) to
-        # the front of the buffer. nginx with `proxy_http_version 1.1`
-        # does not pipeline upstream, but the cost is one move of <1 KB
-        # in the very rare case it happens.
+        # the front of the buffer. The Crystal LB byte-copies traffic
+        # one direction at a time per fiber, so true pipelining only
+        # happens if a downstream client pipelines — the cost is one
+        # move of <1 KB in the very rare case it happens.
         leftover = new_filled - total
         if leftover > 0
           buf.to_unsafe.move_from(buf.to_unsafe + total, leftover)
@@ -188,8 +220,8 @@ module RinhaDeBackend
       end
     rescue IO::Error
       # Connection reset, timeout, peer closed mid-write — normal under
-      # load. Nothing to log; nginx will retry on the other upstream if
-      # the response was lost in flight.
+      # load. Nothing to log; the LB will surface upstream failures to
+      # the client since we don't try to retry across upstream hops.
     ensure
       sock.close rescue nil
     end
@@ -199,7 +231,7 @@ module RinhaDeBackend
     # 4-char and 3-char methods + small literal paths. No hash lookup.
     # ------------------------------------------------------------------
     @[AlwaysInline]
-    private def dispatch(sock : TCPSocket, method : Bytes, path : Bytes, body : Bytes) : Nil
+    private def dispatch(sock : Socket, method : Bytes, path : Bytes, body : Bytes) : Nil
       if method.size == 4 &&
          method.unsafe_fetch(0) == 'P'.ord.to_u8 &&
          method.unsafe_fetch(1) == 'O'.ord.to_u8 &&
@@ -219,7 +251,7 @@ module RinhaDeBackend
     end
 
     @[AlwaysInline]
-    private def handle_fraud_score(sock : TCPSocket, body : Bytes) : Nil
+    private def handle_fraud_score(sock : Socket, body : Bytes) : Nil
       parsed = JsonParser.parse(body)
       vec_f = @vectorizer.vectorize(body, parsed)
       query = StaticArray(Int16, 14).new(0_i16)

@@ -12,7 +12,7 @@ module RinhaDeBackend
   # the vectors) at the end so query-time distances stay in the
   # integer fast path.
   class IvfBuilder
-    DEFAULT_K          = 1024
+    DEFAULT_K          = 2048
     DEFAULT_ITERATIONS =    5
     DEFAULT_SEED       =   42_u64
 
@@ -25,7 +25,11 @@ module RinhaDeBackend
                                       # from quantized centroid c to any vector
                                       # in cell c (ceil). Used at query time for
                                       # triangle-inequality pruning.
-      max_cell_radius : UInt32        # max(cell_radius) — global outer-break bound
+      max_cell_radius : UInt32,       # max(cell_radius) — global outer-break bound
+      bbox_min : Slice(Int16),        # k * dims; per-cell axis-aligned bounding
+                                      # box minimum per dimension. (TODO #4)
+      bbox_max : Slice(Int16)         # k * dims; per-cell axis-aligned bounding
+                                      # box maximum per dimension.
 
     def self.build(vectors : Slice(Int16),
                    labels : Slice(UInt8),
@@ -115,7 +119,15 @@ module RinhaDeBackend
       # Radius is stored *non-squared* (ceil of the integer sqrt) so the
       # query-time check needs only one sqrt per probed cell, not one per
       # vector in the cell.
+      #
+      # Same loop also computes the per-cell axis-aligned bounding box
+      # (TODO #4): bbox_min[c][j] / bbox_max[c][j] = min/max of vec[i][j]
+      # over all vectors `i` in cell `c`. Used at query time to skip a
+      # cell when the squared distance from query to its bbox already
+      # exceeds the current top-5 worst (exact pruning).
       cell_radius = Slice(UInt32).new(k, 0_u32)
+      bbox_min    = Slice(Int16).new(k * dims, 0_i16)
+      bbox_max    = Slice(Int16).new(k * dims, 0_i16)
       max_cell_radius = 0_u32
       c = 0
       while c < k
@@ -123,14 +135,38 @@ module RinhaDeBackend
         start = cell_offsets[c].to_i32
         stop  = cell_offsets[c + 1].to_i32
         max_sq = 0_i64
+
+        # Initialize the bbox to the first vector (or sentinel-safe values
+        # if the cell is empty so the box never matches any query).
+        if start < stop
+          v_off = start * dims
+          j = 0
+          while j < dims
+            v = reordered_vectors[v_off + j]
+            bbox_min[c_off + j] = v
+            bbox_max[c_off + j] = v
+            j += 1
+          end
+        else
+          j = 0
+          while j < dims
+            bbox_min[c_off + j] = Int16::MAX
+            bbox_max[c_off + j] = Int16::MIN
+            j += 1
+          end
+        end
+
         i = start
         while i < stop
           v_off = i * dims
           d = 0_i64
           j = 0
           while j < dims
-            diff = reordered_vectors[v_off + j].to_i32 - centroids_i16[c_off + j].to_i32
+            v = reordered_vectors[v_off + j]
+            diff = v.to_i32 - centroids_i16[c_off + j].to_i32
             d &+= (diff &* diff).to_i64
+            bbox_min[c_off + j] = v if v < bbox_min[c_off + j]
+            bbox_max[c_off + j] = v if v > bbox_max[c_off + j]
             j &+= 1
           end
           max_sq = d if d > max_sq
@@ -145,7 +181,8 @@ module RinhaDeBackend
       end
 
       Result.new(reordered_vectors, reordered_labels, centroids_i16,
-                 cell_offsets, cell_radius, max_cell_radius)
+                 cell_offsets, cell_radius, max_cell_radius,
+                 bbox_min, bbox_max)
     end
 
     # Forgy initialization: pick k distinct random indices and copy the
