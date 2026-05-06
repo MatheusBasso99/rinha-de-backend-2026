@@ -25,7 +25,7 @@
 # volume — skips the TCP/IP stack on the loopback hop entirely.
 
 x-api: &api
-  image: ghcr.io/matheusbasso99/rinha-de-backend-2026:latest
+  image: ghcr.io/matheusbasso99/rinha-de-backend-2026:v2-33cba619
   networks:
     - rinha-net
   volumes:
@@ -76,7 +76,7 @@ services:
       start_period: 10s
 
   lb:
-    image: ghcr.io/matheusbasso99/rinha-de-backend-2026:latest
+    image: ghcr.io/matheusbasso99/rinha-de-backend-2026:v2-33cba619
     container_name: rinha-lb
     hostname: lb
     entrypoint: ["/usr/local/bin/rinha_lb"]
