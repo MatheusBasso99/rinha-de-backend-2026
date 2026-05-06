@@ -2,29 +2,21 @@
 #
 # Constraints enforced here:
 #   - Network mode: bridge (host/privileged forbidden).
-#   - 1 LB + 2 API instances, simple round-robin (in src/lb.cr).
+#   - 1 LB + 2 API instances, simple round-robin (HAProxy mode tcp).
 #   - Sum of all service limits: <= 1 CPU and <= 350 MB RAM.
-#       lb   : 0.10 CPU /  16 MB    (peak measured 8.19 MiB at c=100)
-#       api1 : 0.45 CPU / 167 MB
-#       api2 : 0.45 CPU / 167 MB
+#       lb   : 0.10 CPU /  16 MB    (HAProxy, mode tcp, UDS backends)
+#       api1 : 0.45 CPU / 167 MB    (Crystal API, single-threaded fibers)
+#       api2 : 0.45 CPU / 167 MB    (Crystal API, single-threaded fibers)
 #       total: 1.00 CPU / 350 MB
 #   - App responds on localhost:9999 (published by the LB only).
 #
-# Memory split rationale (iter 10): nginx's old 30 MB allowance was
-# tightened to 16 MB after measuring the Crystal LB's working set
-# under sustained load (c=100, 50k req): peak 8.19 MiB. The 14 MiB
-# headroom redistributed to the APIs (+7 MB each) keeps total = 350.
-# APIs currently use only ~4 MiB working set (the 84 MiB references
-# mmap is file-backed and lives in page cache, not in the container
-# working set), so the redistribution is preventive — it lands real
-# value when TODO #9 (AoSoA16 layout) ships and doubles the per-API
-# dataset footprint.
+# LB choice (this iter): HAProxy `lts-alpine` (3.2). Replaces the
+# previous Crystal `rinha_lb` binary. HAProxy runs in `mode tcp`, so
+# it byte-forwards connections without parsing HTTP — the LB still
+# carries no business logic, matching the rinha rule.
 #
-# LB→API hop runs over Unix Domain Sockets via a shared volume,
-# `rinha-sockets`. The LB binary (`rinha_lb`) replaces nginx; it
-# uses Fiber::ExecutionContext::Parallel (Crystal 1.20) to spread
-# the accept loop and bidirectional copy fibers across two
-# scheduler threads (TODO #8).
+# LB->API hop runs over Unix Domain Sockets via a shared volume,
+# `rinha-sockets`. Same hop as before; only the LB process changed.
 
 x-api: &api
   image: rinha_de_backend:local
@@ -86,10 +78,15 @@ services:
       start_period: 10s
 
   lb:
-    image: rinha_de_backend:local
+    image: haproxy:lts-alpine
+    platform: linux/amd64
     container_name: rinha-lb
     hostname: lb
-    entrypoint: ["/usr/local/bin/rinha_lb"]
+    # Run as root: the API binds its UDS with default mode 0755 root:root,
+    # and HAProxy's worker would otherwise drop to uid 99 (haproxy) and
+    # fail `connect()` on /sockets/api{1,2}.sock with EACCES. Stays inside
+    # the container; LB still has no exposure beyond port 9999.
+    user: "0:0"
     depends_on:
       api1:
         condition: service_healthy
@@ -99,16 +96,7 @@ services:
       - rinha-net
     volumes:
       - rinha-sockets:/sockets
-    environment:
-      RINHA_LB_HOST: 0.0.0.0
-      RINHA_LB_PORT: "9999"
-      RINHA_UPSTREAMS: /sockets/api1.sock,/sockets/api2.sock
-      # Parallelism = 2 matches the Mac Mini Late 2014 physical cores
-      # (Haswell-U i5-4278U, 2C/4T). The cgroup limit (0.10 CPU) caps
-      # aggregate throughput regardless; spreading across schedulers
-      # mainly helps when one fiber is parked in epoll_wait and a
-      # sibling has work ready.
-      RINHA_LB_PARALLELISM: "2"
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
       - "9999:9999"
     deploy:
