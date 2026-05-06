@@ -34,11 +34,20 @@ x-api: &api
     # API binds a UDS, not TCP — `test -S` confirms the socket file is
     # present (the API removes any stale file before bind, then creates
     # it once it's listening, so existence == listening).
+    #
+    # Budget: start_period 60s + retries 30 × interval 2s = 120s total
+    # grace. Iter 11 first run (issue #1930) failed healthcheck with the
+    # previous 30s budget on the Mac Mini Late 2014 (Haswell-U + 5400 RPM
+    # HDD likely): cold MAP_POPULATE of references.bin (~83 MiB) plus
+    # the post-madvise prefault loop can take longer than 30s on slow
+    # storage. The increased grace is no-cost for the actual benchmark
+    # — once the API is healthy, it stays healthy and serves at full
+    # speed.
     test: ["CMD-SHELL", "test -S /sockets/${RINHA_INSTANCE:-api}.sock"]
     interval: 2s
     timeout: 2s
-    retries: 10
-    start_period: 10s
+    retries: 30
+    start_period: 60s
   deploy:
     resources:
       limits:
@@ -58,8 +67,8 @@ services:
       test: ["CMD-SHELL", "test -S /sockets/api1.sock"]
       interval: 2s
       timeout: 2s
-      retries: 10
-      start_period: 10s
+      retries: 30
+      start_period: 60s
 
   api2:
     <<: *api
@@ -72,8 +81,8 @@ services:
       test: ["CMD-SHELL", "test -S /sockets/api2.sock"]
       interval: 2s
       timeout: 2s
-      retries: 10
-      start_period: 10s
+      retries: 30
+      start_period: 60s
 
   lb:
     image: ghcr.io/matheusbasso99/rinha-de-backend-2026:v2-33cba619
