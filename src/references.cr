@@ -16,6 +16,13 @@ module RinhaDeBackend
   #                     centers (quantized to the same scale as vectors).
   #   - `cell_offsets`: Slice(UInt32), length = k + 1; cell `c` spans
   #                     `vectors[cell_offsets[c]..cell_offsets[c+1])`.
+  #   - `cell_radius` : Slice(UInt32), length = k; max non-squared L2
+  #                     distance from quantized centroid `c` to any vector
+  #                     in cell `c` (ceil). Used at query time for the
+  #                     triangle-inequality cell-pruning check.
+  #   - `max_cell_radius`: max over `cell_radius`. Cached in the header so
+  #                       the runtime can use it for a global outer-break
+  #                       check without scanning the per-cell array.
   #
   # Floats are quantized as `(v * 10_000).round.to_i16`. The `-1`
   # sentinel for indices 5/6 (no last_transaction) maps to `-10_000`,
@@ -23,15 +30,17 @@ module RinhaDeBackend
   #
   # Binary file format (little-endian, x86_64):
   #
-  #   bytes  0..3   : magic "RNH2"
+  #   bytes  0..3   : magic "RNH3"
   #   bytes  4..7   : count u32
   #   bytes  8..11  : dims  u32 (= 14)
   #   bytes 12..15  : k     u32 (number of IVF cells)
-  #   bytes 16..63  : reserved (zeroed)
+  #   bytes 16..19  : max_cell_radius u32
+  #   bytes 20..63  : reserved (zeroed)
   #   bytes 64..    : vectors (count * dims * Int16, reordered by cell)
   #   then          : labels  (count * UInt8, reordered by cell)
   #   then          : centroids (k * dims * Int16)
   #   then          : cell_offsets ((k + 1) * UInt32)
+  #   then          : cell_radius (k * UInt32)
   class References
     DEFAULT_PATH     = "resources/references.json.gz"
     DEFAULT_BIN_PATH = "resources/references.bin"
@@ -45,7 +54,7 @@ module RinhaDeBackend
     DEFAULT_CAPACITY = 3_000_000
 
     HEADER_SIZE  =     64
-    HEADER_MAGIC = "RNH2"
+    HEADER_MAGIC = "RNH3"
 
     getter count : Int32
     getter vectors : Slice(Int16)
@@ -53,13 +62,17 @@ module RinhaDeBackend
     getter k : Int32
     getter centroids : Slice(Int16)
     getter cell_offsets : Slice(UInt32)
+    getter cell_radius : Slice(UInt32)
+    getter max_cell_radius : UInt32
 
     private def initialize(@count : Int32,
                            @vectors : Slice(Int16),
                            @labels : Slice(UInt8),
                            @k : Int32 = 0,
                            @centroids : Slice(Int16) = Slice(Int16).new(0, 0_i16),
-                           @cell_offsets : Slice(UInt32) = Slice(UInt32).new(0, 0_u32))
+                           @cell_offsets : Slice(UInt32) = Slice(UInt32).new(0, 0_u32),
+                           @cell_radius : Slice(UInt32) = Slice(UInt32).new(0, 0_u32),
+                           @max_cell_radius : UInt32 = 0_u32)
     end
 
     # Mmap a pre-built binary file produced by `preprocess`.
@@ -88,26 +101,30 @@ module RinhaDeBackend
       count = (base + 4).as(UInt32*).value.to_i32
       dims  = (base + 8).as(UInt32*).value.to_i32
       k     = (base + 12).as(UInt32*).value.to_i32
+      max_cell_radius = (base + 16).as(UInt32*).value
       raise "dims mismatch in #{path}: #{dims} != #{DIMS}" unless dims == DIMS
 
       vectors_off      = HEADER_SIZE
       labels_off       = vectors_off + count * DIMS * sizeof(Int16)
       centroids_off    = labels_off + count * sizeof(UInt8)
       cell_offsets_off = centroids_off + k * DIMS * sizeof(Int16)
-      end_off          = cell_offsets_off + (k + 1) * sizeof(UInt32)
+      cell_radius_off  = cell_offsets_off + (k + 1) * sizeof(UInt32)
+      end_off          = cell_radius_off + k * sizeof(UInt32)
       raise "size mismatch in #{path}: #{size_i64} != #{end_off}" unless size_i64 == end_off
 
       vectors_ptr      = (base + vectors_off).as(Int16*)
       labels_ptr       = (base + labels_off).as(UInt8*)
       centroids_ptr    = (base + centroids_off).as(Int16*)
       cell_offsets_ptr = (base + cell_offsets_off).as(UInt32*)
+      cell_radius_ptr  = (base + cell_radius_off).as(UInt32*)
 
       vectors      = Slice(Int16).new(vectors_ptr, count * DIMS, read_only: true)
       labels       = Slice(UInt8).new(labels_ptr, count, read_only: true)
       centroids    = Slice(Int16).new(centroids_ptr, k * DIMS, read_only: true)
       cell_offsets = Slice(UInt32).new(cell_offsets_ptr, k + 1, read_only: true)
+      cell_radius  = Slice(UInt32).new(cell_radius_ptr, k, read_only: true)
 
-      new(count, vectors, labels, k, centroids, cell_offsets)
+      new(count, vectors, labels, k, centroids, cell_offsets, cell_radius, max_cell_radius)
     end
 
     # Builds the binary file by parsing JSON, running k-means and
@@ -133,6 +150,7 @@ module RinhaDeBackend
       output_io.write(result.labels.to_unsafe_bytes)
       output_io.write(result.centroids.to_unsafe_bytes)
       output_io.write(result.cell_offsets.to_unsafe_bytes)
+      output_io.write(result.cell_radius.to_unsafe_bytes)
 
       # Backfill header.
       output_io.seek(0)
@@ -140,7 +158,7 @@ module RinhaDeBackend
       output_io.write_bytes(raw.count.to_u32, IO::ByteFormat::LittleEndian)
       output_io.write_bytes(DIMS.to_u32, IO::ByteFormat::LittleEndian)
       output_io.write_bytes(k.to_u32, IO::ByteFormat::LittleEndian)
-      output_io.write_bytes(0_u32, IO::ByteFormat::LittleEndian)
+      output_io.write_bytes(result.max_cell_radius, IO::ByteFormat::LittleEndian)
 
       raw.count
     end

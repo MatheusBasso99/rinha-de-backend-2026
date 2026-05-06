@@ -20,7 +20,12 @@ module RinhaDeBackend
       vectors : Slice(Int16),         # count * dims, reordered by cell
       labels : Slice(UInt8),          # count, reordered by cell
       centroids : Slice(Int16),       # k * dims, quantized in vector scale
-      cell_offsets : Slice(UInt32)    # k+1 entries; cell c spans [off[c]..off[c+1])
+      cell_offsets : Slice(UInt32),   # k+1 entries; cell c spans [off[c]..off[c+1])
+      cell_radius : Slice(UInt32),    # k entries; max non-squared L2 distance
+                                      # from quantized centroid c to any vector
+                                      # in cell c (ceil). Used at query time for
+                                      # triangle-inequality pruning.
+      max_cell_radius : UInt32        # max(cell_radius) — global outer-break bound
 
     def self.build(vectors : Slice(Int16),
                    labels : Slice(UInt8),
@@ -105,7 +110,42 @@ module RinhaDeBackend
         j += 1
       end
 
-      Result.new(reordered_vectors, reordered_labels, centroids_i16, cell_offsets)
+      # Compute per-cell radius using the quantized centroids and reordered
+      # vectors — the exact same Int16 → Int32 → Int64 math the runtime uses.
+      # Radius is stored *non-squared* (ceil of the integer sqrt) so the
+      # query-time check needs only one sqrt per probed cell, not one per
+      # vector in the cell.
+      cell_radius = Slice(UInt32).new(k, 0_u32)
+      max_cell_radius = 0_u32
+      c = 0
+      while c < k
+        c_off = c * dims
+        start = cell_offsets[c].to_i32
+        stop  = cell_offsets[c + 1].to_i32
+        max_sq = 0_i64
+        i = start
+        while i < stop
+          v_off = i * dims
+          d = 0_i64
+          j = 0
+          while j < dims
+            diff = reordered_vectors[v_off + j].to_i32 - centroids_i16[c_off + j].to_i32
+            d &+= (diff &* diff).to_i64
+            j &+= 1
+          end
+          max_sq = d if d > max_sq
+          i &+= 1
+        end
+        # ceil(sqrt(max_sq)) — keep the bound conservative so we never skip
+        # a cell that could legitimately contain a top-K candidate.
+        r = Math.sqrt(max_sq.to_f64).ceil.to_u32
+        cell_radius[c] = r
+        max_cell_radius = r if r > max_cell_radius
+        c += 1
+      end
+
+      Result.new(reordered_vectors, reordered_labels, centroids_i16,
+                 cell_offsets, cell_radius, max_cell_radius)
     end
 
     # Forgy initialization: pick k distinct random indices and copy the
