@@ -12,7 +12,7 @@ module RinhaDeBackend
     end
 
     # Returns how many of the K nearest neighbors carry the "fraud" label.
-    def fraud_count_top_k(query : StaticArray(Int16, 14)) : Int32
+    def fraud_count_top_k(query : StaticArray(Int16, 16)) : Int32
       vectors = @refs.vectors
       labels  = @refs.labels
       count   = @refs.count
@@ -36,7 +36,6 @@ module RinhaDeBackend
         while j < dims
           diff = query_ptr[j].to_i32 - vec_ptr[offset + j].to_i32
           d &+= (diff * diff).to_i64
-          break if d >= worst
           j &+= 1
         end
 

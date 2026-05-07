@@ -137,7 +137,10 @@ module RinhaDeBackend
         max_sq = 0_i64
 
         # Initialize the bbox to the first vector (or sentinel-safe values
-        # if the cell is empty so the box never matches any query).
+        # if the cell is empty so the box never matches any query). For
+        # the empty case we pin the pad lanes (indices LOGICAL_DIMS..dims)
+        # to 0 so a zero-padded query also lands inside [lo, hi] = [0, 0]
+        # and contributes 0 — keeping the bbox check exact across pad.
         if start < stop
           v_off = start * dims
           j = 0
@@ -149,9 +152,14 @@ module RinhaDeBackend
           end
         else
           j = 0
-          while j < dims
+          while j < References::LOGICAL_DIMS
             bbox_min[c_off + j] = Int16::MAX
             bbox_max[c_off + j] = Int16::MIN
+            j += 1
+          end
+          while j < dims
+            bbox_min[c_off + j] = 0_i16
+            bbox_max[c_off + j] = 0_i16
             j += 1
           end
         end

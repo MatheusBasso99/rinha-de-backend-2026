@@ -9,11 +9,19 @@ module RinhaDeBackend
   #
   #   - `vectors`     : Slice(Int16), length = count * DIMS, row-major,
   #                     reordered so that vectors of the same IVF cell
-  #                     are contiguous.
+  #                     are contiguous. Each row is `DIMS = 16` Int16
+  #                     lanes (32 bytes, naturally aligned for AVX2):
+  #                     14 logical feature lanes followed by 2 zero-pad
+  #                     lanes so a single VPMADDWD ymm covers the full
+  #                     squared-L2 inner product (Haswell: 5c lat /
+  #                     1c throughput). Pad lanes are zero on both
+  #                     stored vectors and queries, so they contribute
+  #                     0 to every distance and bbox check.
   #   - `labels`      : Slice(UInt8), length = count, 1 = fraud, 0 = legit,
   #                     reordered the same way as `vectors`.
   #   - `centroids`   : Slice(Int16), length = k * DIMS, the IVF cell
-  #                     centers (quantized to the same scale as vectors).
+  #                     centers (quantized to the same scale as vectors,
+  #                     same 14+2 zero-pad layout).
   #   - `cell_offsets`: Slice(UInt32), length = k + 1; cell `c` spans
   #                     `vectors[cell_offsets[c]..cell_offsets[c+1])`.
   #   - `cell_radius` : Slice(UInt32), length = k; max non-squared L2
@@ -24,9 +32,11 @@ module RinhaDeBackend
   #                       the runtime can use it for a global outer-break
   #                       check without scanning the per-cell array.
   #   - `bbox_min`    : Slice(Int16), length = k * DIMS. Per-cell axis-
-  #                     aligned bounding box minimum per dimension.
+  #                     aligned bounding box minimum per dimension
+  #                     (pad lanes pinned to 0).
   #   - `bbox_max`    : Slice(Int16), length = k * DIMS. Per-cell axis-
-  #                     aligned bounding box maximum per dimension.
+  #                     aligned bounding box maximum per dimension
+  #                     (pad lanes pinned to 0).
   #                     Used at query time for an exact cell-pruning
   #                     check tighter than triangle-inequality.
   #
@@ -36,9 +46,10 @@ module RinhaDeBackend
   #
   # Binary file format (little-endian, x86_64):
   #
-  #   bytes  0..3   : magic "RNH4"
+  #   bytes  0..3   : magic "RNH5"   (bumped from RNH4 when stride went
+  #                                   14 → 16 for AVX2 VPMADDWD lanes)
   #   bytes  4..7   : count u32
-  #   bytes  8..11  : dims  u32 (= 14)
+  #   bytes  8..11  : dims  u32 (= 16, the row stride)
   #   bytes 12..15  : k     u32 (number of IVF cells)
   #   bytes 16..19  : max_cell_radius u32
   #   bytes 20..63  : reserved (zeroed)
@@ -53,8 +64,15 @@ module RinhaDeBackend
     DEFAULT_PATH     = "resources/references.json.gz"
     DEFAULT_BIN_PATH = "resources/references.bin"
 
-    DIMS  = 14
-    SCALE = 10_000.0_f64
+    # Row stride in Int16 lanes (also the count Float lanes the
+    # vectorizer emits, padded to a multiple of 16). The 14 logical
+    # feature dimensions live at indices 0..13; indices 14..15 are
+    # always zero on both stored vectors and queries.
+    DIMS = 16
+    # Number of logical (non-pad) feature dims. Useful for code that
+    # walks only the fields the vectorizer actually fills.
+    LOGICAL_DIMS = 14
+    SCALE        = 10_000.0_f64
 
     LABEL_LEGIT = 0_u8
     LABEL_FRAUD = 1_u8
@@ -62,7 +80,7 @@ module RinhaDeBackend
     DEFAULT_CAPACITY = 3_000_000
 
     HEADER_SIZE  =     64
-    HEADER_MAGIC = "RNH4"
+    HEADER_MAGIC = "RNH5"
 
     getter count : Int32
     getter vectors : Slice(Int16)
@@ -100,6 +118,16 @@ module RinhaDeBackend
                            @mmap_size : Int64 = 0_i64)
     end
 
+    # Compile-time mmap flag set: prefault on Linux, plain shared
+    # mapping elsewhere (macOS dev boxes have no MAP_POPULATE).
+    private def self.mmap_flags
+      {% if flag?(:linux) %}
+        LibC::MAP_SHARED | LibC::MAP_POPULATE
+      {% else %}
+        LibC::MAP_SHARED
+      {% end %}
+    end
+
     # Mmap a pre-built binary file produced by `preprocess`.
     def self.mmap(path : String = DEFAULT_BIN_PATH) : References
       size_i64 = File.size(path)
@@ -108,11 +136,15 @@ module RinhaDeBackend
       fd = LibC.open(path, LibC::O_RDONLY)
       raise "open(#{path}) failed: errno=#{Errno.value}" if fd < 0
 
+      # MAP_POPULATE / MADV_HUGEPAGE are Linux-only. On macOS dev boxes
+      # we fall back to a plain MAP_SHARED so specs compile and run
+      # without a Linux container; the prod target is linux/amd64
+      # (see Dockerfile) where both flags are honored.
       ptr = LibC.mmap(
         Pointer(Void).null,
         LibC::SizeT.new(size_i64),
         LibC::PROT_READ,
-        LibC::MAP_SHARED | LibC::MAP_POPULATE,
+        mmap_flags,
         fd,
         0_i64
       )
@@ -123,7 +155,9 @@ module RinhaDeBackend
       # huge pages. Best-effort — the kernel may decline (depends on THP
       # policy and filesystem support for file-backed THP). The actual
       # touch loop lives in `prefault!`, called during warm-up.
-      LibC.madvise(ptr, LibC::SizeT.new(size_i64), LibC::MADV_HUGEPAGE)
+      {% if flag?(:linux) %}
+        LibC.madvise(ptr, LibC::SizeT.new(size_i64), LibC::MADV_HUGEPAGE)
+      {% end %}
 
       base = ptr.as(UInt8*)
       magic = String.new(base, 4)
@@ -133,7 +167,7 @@ module RinhaDeBackend
       dims  = (base + 8).as(UInt32*).value.to_i32
       k     = (base + 12).as(UInt32*).value.to_i32
       max_cell_radius = (base + 16).as(UInt32*).value
-      raise "dims mismatch in #{path}: #{dims} != #{DIMS}" unless dims == DIMS
+      raise "dims mismatch in #{path}: #{dims} != #{DIMS} (rebuild references.bin — header expects stride #{DIMS})" unless dims == DIMS
 
       vectors_off      = HEADER_SIZE
       labels_off       = vectors_off + count * DIMS * sizeof(Int16)
@@ -235,6 +269,9 @@ module RinhaDeBackend
     end
 
     # Stream-parse the JSON array from `io` into pre-allocated slices.
+    # Each row is laid out at stride `DIMS = 16` with the 14 logical
+    # feature lanes followed by 2 zero-pad lanes (left at 0 by the
+    # zeroed slice initializer, never written here).
     def self.load_from_io(io : IO, capacity : Int32 = DEFAULT_CAPACITY) : References
       pull = JSON::PullParser.new(io)
 

@@ -21,6 +21,12 @@ describe RinhaDeBackend::References do
       refs.vectors[i].should eq(expected[i])
     end
 
+    # The 2 pad lanes at the end of every row are pinned to zero; the
+    # IVF/KNN kernels rely on this so VPMADDWD over the full 16-lane
+    # row produces the exact same squared-L2 as the 14-lane version.
+    refs.vectors[14].should eq(0_i16)
+    refs.vectors[15].should eq(0_i16)
+
     refs.labels[0].should eq(RinhaDeBackend::References::LABEL_LEGIT)
   end
 
@@ -42,6 +48,10 @@ describe RinhaDeBackend::References do
       refs.labels.size.should eq(100)
       refs.centroids.size.should eq(4 * RinhaDeBackend::References::DIMS)
       refs.cell_offsets.size.should eq(5)
+      # Bbox layout follows the row stride (DIMS = 16); each cell has
+      # 14 logical lanes plus 2 zero-pad lanes.
+      refs.bbox_min.size.should eq(4 * RinhaDeBackend::References::DIMS)
+      refs.bbox_max.size.should eq(4 * RinhaDeBackend::References::DIMS)
 
       # cell_offsets are cumulative: last entry must equal count.
       refs.cell_offsets[4].should eq(100_u32)
@@ -68,9 +78,14 @@ describe RinhaDeBackend::References do
       # base_nprobe == k → exact (every cell scanned in phase A; no retry).
       ivf = RinhaDeBackend::Ivf.new(refs, base_nprobe: 4, retry_nprobe: 0)
 
+      stride = RinhaDeBackend::References::DIMS
       refs.count.times do |i|
-        query = StaticArray(Int16, 14).new(0_i16)
-        14.times { |j| query[j] = refs.vectors[i * 14 + j] }
+        query = StaticArray(Int16, 16).new(0_i16)
+        # Copy the 14 logical lanes — pad lanes stay 0, matching the
+        # zero pad pinned in `references.bin`.
+        RinhaDeBackend::References::LOGICAL_DIMS.times do |j|
+          query[j] = refs.vectors[i * stride + j]
+        end
 
         ivf.fraud_count_top_k(query).should eq(knn.fraud_count_top_k(query))
       end
@@ -87,14 +102,18 @@ describe RinhaDeBackend::Knn do
   knn = RinhaDeBackend::Knn.new(refs)
 
   it "returns 0 frauds when nearest neighbors are all legit" do
-    query = StaticArray(Int16, 14).new(0_i16)
+    query = StaticArray(Int16, 16).new(0_i16)
     14.times { |i| query[i] = refs.vectors[i] }
 
     knn.fraud_count_top_k(query).should be <= 2
   end
 
   it "honors the -10_000 sentinel for missing-history dimensions" do
-    query = StaticArray(Int16, 14).new(-10_000_i16)
+    # Sentinel covers only the 14 logical dims; pad lanes (14, 15)
+    # stay zero so distances against zero-padded stored rows behave
+    # the same as before the row-stride bump.
+    query = StaticArray(Int16, 16).new(0_i16)
+    14.times { |i| query[i] = -10_000_i16 }
     result = knn.fraud_count_top_k(query)
     result.should be >= 0
     result.should be <= 5

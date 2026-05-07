@@ -34,21 +34,21 @@ module RinhaDeBackend
   #      with `R_max = max_cell_radius`, no remaining cell can possibly
   #      displace the current top-5. The fraud count is locked — break.
   #
-  # Inside the per-vector L2 inner loop, a chunked early-exit
-  # checks the partial sum only after dims 4, 8, and 12 (instead of every
-  # dim). This lets LLVM auto-vectorize / instruction-schedule each
-  # 4-dim chunk without a per-iteration branch breaking the
-  # straight-line code.
+  # Inside the per-vector inner loop, the squared-L2 is a single straight
+  # 16-lane pass: vector rows are stored at stride 16 with the 14 logical
+  # dims in lanes 0..13 and zero pad in lanes 14..15. With `--mcpu=haswell`
+  # LLVM lowers the loop to one VPMADDWD ymm (5c lat / 1c throughput on
+  # ports P0+P1) producing the full squared inner product for the row in
+  # a single iteration. Decision-aware outer break + bbox prune still
+  # skip whole cells; we only drop the per-dim early-exit because at
+  # 1 cycle per vector it's cheaper to compute the full distance than
+  # to mispredict a per-chunk branch.
   #
-  # All three skips preserve exact answers: no recall loss, just CPU saved.
+  # All three cell skips preserve exact answers: no recall loss, just CPU saved.
   class Ivf
     DEFAULT_BASE_NPROBE  =  8
     DEFAULT_RETRY_NPROBE = 16
     TOPK                 =  5
-
-    # Empirically discriminative dim order: high-variance dims first so the
-    # partial-sum early-exit (`break if d >= worst`) hits the bound sooner.
-    DIM_ORDER = StaticArray[5, 6, 2, 0, 7, 8, 11, 12, 9, 10, 1, 13, 3, 4]
 
     def initialize(@refs : References,
                    @base_nprobe : Int32 = DEFAULT_BASE_NPROBE,
@@ -68,7 +68,8 @@ module RinhaDeBackend
     #
     #   Phase A — scan the `base_nprobe` (8) nearest cells. Run the full
     #             pruning stack (per-cell triangle, per-cell bbox,
-    #             decision-aware outer break) and a chunked L2 inner loop.
+    #             decision-aware outer break) and a flat 16-lane L2 inner
+    #             loop (single VPMADDWD ymm under `--mcpu=haswell`).
     #
     #   Phase B — only when the top-5 from phase A lands at the decision
     #             threshold (`frauds ∈ {2, 3}`, where one swap flips the
@@ -80,7 +81,7 @@ module RinhaDeBackend
     # In the common path (frauds ∈ {0, 1, 4, 5}) the retry is skipped
     # entirely — mean/p50 latency drops ~2× vs the previous always-16
     # baseline.
-    def fraud_count_top_k(query : StaticArray(Int16, 14)) : Int32
+    def fraud_count_top_k(query : StaticArray(Int16, 16)) : Int32
       vectors         = @refs.vectors
       labels          = @refs.labels
       centroids       = @refs.centroids
@@ -102,7 +103,6 @@ module RinhaDeBackend
       bmin_ptr    = bbox_min.to_unsafe
       bmax_ptr    = bbox_max.to_unsafe
       query_ptr   = query.to_unsafe
-      order_ptr   = DIM_ORDER.to_unsafe
 
       # ---------------- Stage 1: pick top-`total_nprobe` cells. -----------
       # Always pick the top BASE+RETRY centroids in a single pass — even when
@@ -115,11 +115,11 @@ module RinhaDeBackend
 
       c = 0
       while c < k
-        c_off = c * dims
+        c_off = c &* dims
         d = 0_i64
         j = 0
         while j < dims
-          diff = query_ptr[j].to_i32 - cent_ptr[c_off + j].to_i32
+          diff = query_ptr[j].to_i32 &- cent_ptr[c_off &+ j].to_i32
           d &+= (diff &* diff).to_i64
           j &+= 1
         end
@@ -153,13 +153,6 @@ module RinhaDeBackend
       best_label = StaticArray(UInt8, 5).new(0_u8)
       worst = Int64::MAX
 
-      # Hoist DIM_ORDER indices once for the entire query — the inner
-      # chunked loop has no order_ptr[] indirection at all.
-      o0  = order_ptr[0];  o1  = order_ptr[1];  o2  = order_ptr[2];  o3  = order_ptr[3]
-      o4  = order_ptr[4];  o5  = order_ptr[5];  o6  = order_ptr[6];  o7  = order_ptr[7]
-      o8  = order_ptr[8];  o9  = order_ptr[9];  o10 = order_ptr[10]; o11 = order_ptr[11]
-      o12 = order_ptr[12]; o13 = order_ptr[13]
-
       # Phase loop: phase 0 scans probes [0..base_nprobe);
       #             phase 1 scans probes [base_nprobe..total_nprobe), only
       #             entered when frauds ∈ {2, 3} after phase 0.
@@ -186,14 +179,15 @@ module RinhaDeBackend
 
           # (b) Per-cell bounding-box exact skip. Min squared
           # distance from `query` to the axis-aligned bbox of this cell.
+          # Pad lanes (indices 14, 15) carry lo = hi = 0 and the query is
+          # zero on those lanes too, so they contribute nothing.
           bb_off = cell &* dims
           bb_d = 0_i64
           bj = 0
           while bj < dims
-            idx_b = order_ptr[bj]
-            q_b = query_ptr[idx_b].to_i32
-            lo  = bmin_ptr[bb_off &+ idx_b].to_i32
-            hi  = bmax_ptr[bb_off &+ idx_b].to_i32
+            q_b = query_ptr[bj].to_i32
+            lo  = bmin_ptr[bb_off &+ bj].to_i32
+            hi  = bmax_ptr[bb_off &+ bj].to_i32
             if q_b < lo
               diff_b = lo &- q_b
               bb_d &+= (diff_b &* diff_b).to_i64
@@ -215,60 +209,34 @@ module RinhaDeBackend
           i = start
           while i < stop
             off = i &* dims
-            d = 0_i64
 
-            # Chunk 0 (dims order[0..3]).
-            df = query_ptr[o0].to_i32 &- vec_ptr[off &+ o0].to_i32
-            d &+= (df &* df).to_i64
-            df = query_ptr[o1].to_i32 &- vec_ptr[off &+ o1].to_i32
-            d &+= (df &* df).to_i64
-            df = query_ptr[o2].to_i32 &- vec_ptr[off &+ o2].to_i32
-            d &+= (df &* df).to_i64
-            df = query_ptr[o3].to_i32 &- vec_ptr[off &+ o3].to_i32
-            d &+= (df &* df).to_i64
+            # 16-lane straight L2² over a single row.
+            #
+            # On Haswell with `--mcpu=haswell` the loop body lowers to:
+            #   vmovdqu  ymm0, [vec_ptr + off]      ; one row, 32 B aligned
+            #   vmovdqu  ymm1, [query_ptr]          ; broadcast-style reuse
+            #   vpsubw   ymm2, ymm0, ymm1
+            #   vpmaddwd ymm3, ymm2, ymm2           ; 8× (Δ²+Δ²) → 8 i32
+            #   vpmovsxdq+vpaddq → reduce to scalar i64 outside the loop
+            # so the per-vector inner cost is one VPMADDWD (1c thr, P0+P1).
+            d = 0_i64
+            j = 0
+            while j < dims
+              diff = query_ptr[j].to_i32 &- vec_ptr[off &+ j].to_i32
+              d &+= (diff &* diff).to_i64
+              j &+= 1
+            end
 
             if d < worst
-              # Chunk 1 (dims order[4..7]).
-              df = query_ptr[o4].to_i32 &- vec_ptr[off &+ o4].to_i32
-              d &+= (df &* df).to_i64
-              df = query_ptr[o5].to_i32 &- vec_ptr[off &+ o5].to_i32
-              d &+= (df &* df).to_i64
-              df = query_ptr[o6].to_i32 &- vec_ptr[off &+ o6].to_i32
-              d &+= (df &* df).to_i64
-              df = query_ptr[o7].to_i32 &- vec_ptr[off &+ o7].to_i32
-              d &+= (df &* df).to_i64
-
-              if d < worst
-                # Chunk 2 (dims order[8..11]).
-                df = query_ptr[o8].to_i32 &- vec_ptr[off &+ o8].to_i32
-                d &+= (df &* df).to_i64
-                df = query_ptr[o9].to_i32 &- vec_ptr[off &+ o9].to_i32
-                d &+= (df &* df).to_i64
-                df = query_ptr[o10].to_i32 &- vec_ptr[off &+ o10].to_i32
-                d &+= (df &* df).to_i64
-                df = query_ptr[o11].to_i32 &- vec_ptr[off &+ o11].to_i32
-                d &+= (df &* df).to_i64
-
-                if d < worst
-                  # Chunk 3 (dims order[12..13], 2 dims).
-                  df = query_ptr[o12].to_i32 &- vec_ptr[off &+ o12].to_i32
-                  d &+= (df &* df).to_i64
-                  df = query_ptr[o13].to_i32 &- vec_ptr[off &+ o13].to_i32
-                  d &+= (df &* df).to_i64
-
-                  if d < worst
-                    slot = TOPK &- 1
-                    while slot > 0 && best_dist[slot &- 1] > d
-                      best_dist[slot]  = best_dist[slot &- 1]
-                      best_label[slot] = best_label[slot &- 1]
-                      slot &-= 1
-                    end
-                    best_dist[slot]  = d
-                    best_label[slot] = lab_ptr[i]
-                    worst = best_dist[TOPK &- 1]
-                  end
-                end
+              slot = TOPK &- 1
+              while slot > 0 && best_dist[slot &- 1] > d
+                best_dist[slot]  = best_dist[slot &- 1]
+                best_label[slot] = best_label[slot &- 1]
+                slot &-= 1
               end
+              best_dist[slot]  = d
+              best_label[slot] = lab_ptr[i]
+              worst = best_dist[TOPK &- 1]
             end
 
             i &+= 1

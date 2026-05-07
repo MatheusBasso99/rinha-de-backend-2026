@@ -29,7 +29,7 @@ module RinhaDeBackend
   # skip, without the per-cell bbox skip, and without the decision-aware
   # outer break. Comparing pruned vs unpruned with the same retry policy
   # isolates the effect of the cell-pruning skips from the retry logic.
-  def self.fraud_count_unpruned(query : StaticArray(Int16, 14)) : Int32
+  def self.fraud_count_unpruned(query : StaticArray(Int16, 16)) : Int32
     vectors      = REFS.vectors
     labels       = REFS.labels
     centroids    = REFS.centroids
@@ -158,9 +158,11 @@ module RinhaDeBackend
     idx = rng.rand(REFS.count)
     src = idx * References::DIMS
 
-    query = StaticArray(Int16, 14).new(0_i16)
+    # Query mirrors the on-disk row layout: 14 jittered logical lanes
+    # plus 2 zero pad lanes (left at 0 by the StaticArray initializer).
+    query = StaticArray(Int16, 16).new(0_i16)
     j = 0
-    while j < References::DIMS
+    while j < References::LOGICAL_DIMS
       v = REFS.vectors[src + j].to_i32
       if JITTER > 0
         v += rng.rand(-JITTER..JITTER)

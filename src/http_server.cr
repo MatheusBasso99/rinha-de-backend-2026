@@ -255,7 +255,10 @@ module RinhaDeBackend
     private def handle_fraud_score(sock : Socket, body : Bytes) : Nil
       parsed = JsonParser.parse(body)
       vec_f = @vectorizer.vectorize(body, parsed)
-      query = StaticArray(Int16, 14).new(0_i16)
+      # Query mirrors the stored row layout: 14 logical lanes (filled
+      # below) + 2 zero pad lanes (left at 0 by the StaticArray
+      # initializer) so the IVF kernel can VPMADDWD over a full ymm.
+      query = StaticArray(Int16, 16).new(0_i16)
       14.times do |i|
         query[i] = (vec_f[i] * References::SCALE.to_f32).round.to_i16
       end

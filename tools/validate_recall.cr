@@ -173,7 +173,10 @@ module RinhaDeBackend
     idx = rng.rand(REFS.count)
     src = idx * DIMS
     j = 0
-    while j < DIMS
+    # Logical lanes get optional jitter; pad lanes (DIMS-2..DIMS) are
+    # pinned to 0 to match the on-disk row layout — jittering them
+    # would model a query the vectorizer can't produce.
+    while j < References::LOGICAL_DIMS
       v = REFS.vectors[src + j].to_i32
       if jitter > 0
         v += rng.rand(-jitter..jitter)
@@ -181,6 +184,10 @@ module RinhaDeBackend
         v = Int16::MAX.to_i32 if v > Int16::MAX
       end
       query_buf[j] = v.to_i16
+      j += 1
+    end
+    while j < DIMS
+      query_buf[j] = 0_i16
       j += 1
     end
 
