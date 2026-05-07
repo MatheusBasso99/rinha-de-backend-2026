@@ -81,20 +81,43 @@ module RinhaDeBackend
     def initialize(@host : String, @port : Int32, @vectorizer : Vectorizer, @ivf : Ivf, @uds_path : String? = nil)
     end
 
-    def listen : Nil
+    # Bind the listening socket. Returns the bound server so the caller
+    # can run any post-bind warm-up (e.g. prefault!) before entering
+    # the accept loop. Splitting bind from accept lets the docker
+    # healthcheck (`test -S /sockets/api*.sock`) pass as soon as the
+    # socket file appears, even if subsequent boot work takes a while
+    # on slow disks (Mac Mini Late 2014 HDD).
+    def bind! : Socket::Server
       if path = @uds_path
-        # UNIXServer auto-deletes any leftover socket file before bind
-        # (Crystal stdlib guarantee), so unclean LB restarts don't wedge
-        # us with EADDRINUSE.
+        # Crystal's UNIXServer does NOT auto-delete a stale socket file;
+        # `bind(2)` returns EADDRINUSE if it exists. The Rinha engine
+        # may reuse the named volume across runs, leaving a leftover
+        # socket from a previous test, so we delete it explicitly.
+        File.delete(path) if File.exists?(path)
         uds = UNIXServer.new(path)
         log "listening on uds=#{path}"
-        accept_loop(uds)
+        uds
       else
         tcp = TCPServer.new(@host, @port, reuse_port: false)
         tcp.reuse_address = true
         log "listening on #{@host}:#{@port}"
-        accept_loop(tcp)
+        tcp
       end
+    end
+
+    def accept!(server : Socket::Server) : Nil
+      case server
+      when UNIXServer
+        accept_loop(server)
+      when TCPServer
+        accept_loop(server)
+      else
+        raise "unsupported server type: #{server.class}"
+      end
+    end
+
+    def listen : Nil
+      accept!(bind!)
     end
 
     # Two overloads: the concrete-typed `accept` returns the matching

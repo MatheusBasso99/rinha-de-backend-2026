@@ -23,20 +23,12 @@ module RinhaDeBackend
       mcc_risk = MccRisk.new
 
       log_phase "mmapping references"
-      refs = References.mmap
-      log_phase "mmapped #{refs.count} references"
-
-      # Post-madvise warm-up touch. Brings every 4 KiB page into
-      # residence and gives khugepaged an opportunity to fold them into
-      # 2 MiB transparent huge pages, cutting TLB pressure during cold
-      # cluster scans (the dominant tail cause).
-      t_pf = Time.instant
-      refs.prefault!
-      log_phase "prefaulted references in #{(Time.instant - t_pf).total_milliseconds.round(1)}ms"
+      @refs = References.mmap
+      log_phase "mmapped #{@refs.count} references"
 
       vectorizer = Vectorizer.new(mcc_risk)
-      ivf = Ivf.new(refs)
-      log_phase "ivf ready: k=#{refs.k} base_nprobe=#{ivf.base_nprobe} retry_nprobe=#{ivf.retry_nprobe}"
+      ivf = Ivf.new(@refs)
+      log_phase "ivf ready: k=#{@refs.k} base_nprobe=#{ivf.base_nprobe} retry_nprobe=#{ivf.retry_nprobe}"
 
       # When RINHA_LISTEN_UDS is set the API binds the matching Unix
       # Domain Socket and the LB (HAProxy in prod, see haproxy.cfg) is
@@ -47,24 +39,35 @@ module RinhaDeBackend
     end
 
     def listen : Nil
-      # Hot path is now zero-allocation: HttpServer reuses an 8 KB stack
-      # buffer per fiber, the pure-Crystal HttpParser does the parse in
-      # place against that buffer, JsonParser writes into a stack struct,
-      # response Bytes are pre-rendered constants, and IVF runs over
-      # mmapped Int16 slices outside the GC heap. Under those invariants
-      # we can drop the collector entirely and remove the last source of
-      # tail-latency variance.
-      #
-      # Safety valve: a watchdog fiber logs GC.stats every few seconds.
-      # If heap_size grows monotonically here, we know an allocation
-      # leaked into the hot path and can flip back to incremental.
+      # Hot path is zero-allocation; flip the GC off before serving.
       GC.collect
       GC.disable
       log_phase "GC disabled (heap_size=#{GC.stats.heap_size})"
 
       spawn gc_stats_loop if GC_STATS_PERIOD > 0
 
-      @http.listen
+      # Bind FIRST so the docker healthcheck (`test -S
+      # /sockets/api*.sock`) passes immediately. The Mac Mini Late 2014
+      # rig has a slow HDD; if the prefault loop runs before bind, the
+      # socket file might not appear inside the healthcheck grace
+      # (start_period + retries × interval), and `depends_on:
+      # service_healthy` brings the whole stack down. Bind takes
+      # microseconds; prefault can take much longer on cold cache.
+      server = @http.bind!
+
+      # Post-madvise warm-up touch. Brings every 4 KiB page into
+      # residence and gives khugepaged an opportunity to fold them into
+      # 2 MiB transparent huge pages, cutting TLB pressure during cold
+      # cluster scans. Runs after bind so the healthcheck observes the
+      # socket file ASAP; the kernel queues incoming UDS connections
+      # while we walk the mmap, and the LB doesn't start serving k6
+      # traffic until *its own* container is up (gated by api1/api2
+      # healthy).
+      t_pf = Time.instant
+      @refs.prefault!
+      log_phase "prefaulted references in #{(Time.instant - t_pf).total_milliseconds.round(1)}ms"
+
+      @http.accept!(server)
     end
 
     private def gc_stats_loop : Nil
