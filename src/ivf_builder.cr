@@ -13,7 +13,7 @@ module RinhaDeBackend
   # integer fast path.
   class IvfBuilder
     DEFAULT_K          = 2048
-    DEFAULT_ITERATIONS =    5
+    DEFAULT_ITERATIONS =   12
     DEFAULT_SEED       =   42_u64
 
     record Result,
@@ -44,7 +44,7 @@ module RinhaDeBackend
       centroids = Slice(Float64).new(k * dims, 0.0)
       assignments = Slice(Int32).new(count, 0)
 
-      init_random!(centroids, vectors, count, dims, k, seed)
+      init_kmeans_plus_plus!(centroids, vectors, count, dims, k, seed)
 
       iterations.times do |iter|
         t0 = Time.instant
@@ -193,34 +193,105 @@ module RinhaDeBackend
                  bbox_min, bbox_max)
     end
 
-    # Forgy initialization: pick k distinct random indices and copy the
-    # corresponding vectors into the centroid buffer.
-    private def self.init_random!(centroids : Slice(Float64),
-                                  vectors : Slice(Int16),
-                                  count : Int32,
-                                  dims : Int32,
-                                  k : Int32,
-                                  seed : UInt64) : Nil
-      r = Random.new(seed)
-      seen = Set(Int32).new(initial_capacity: k)
-      idx = Array(Int32).new(k)
-      while seen.size < k
-        candidate = r.rand(count)
-        next if seen.includes?(candidate)
-        seen << candidate
-        idx << candidate
-      end
+    # k-means++ initialization (F1.2): D²-weighted seeding. Tighter
+    # cluster boundaries than plain Forgy → queries land in the right
+    # cell more often, recall@5 climbs without runtime cost (the extra
+    # work runs once at Docker build time).
+    #
+    # Inner distance loop matches the runtime IVF kernel: Int16 lanes
+    # widened to Int32, squared and summed in Int64, no Float64. The
+    # 16-lane row stride enables the same vpmaddwd codegen path.
+    # min_d2 stores the squared L² in Int64 (max per-row L² ≈ 5.6 × 10⁹,
+    # cumulative sum across 3M rows ≈ 1.7 × 10¹⁶ — fits in Int64).
+    private def self.init_kmeans_plus_plus!(centroids : Slice(Float64),
+                                            vectors : Slice(Int16),
+                                            count : Int32,
+                                            dims : Int32,
+                                            k : Int32,
+                                            seed : UInt64) : Nil
+      rng = Random.new(seed)
+      min_d2 = Slice(Int64).new(count, Int64::MAX)
 
-      i = 0
-      while i < k
-        src = idx[i] * dims
-        dst = i * dims
-        d = 0
-        while d < dims
-          centroids[dst + d] = vectors[src + d].to_f64
-          d += 1
+      first_idx = rng.rand(count)
+      copy_vec_to_centroid(vectors, first_idx, centroids, 0, dims)
+      update_min_d2!(min_d2, vectors, count, dims, vectors, first_idx)
+
+      c = 1
+      while c < k
+        total = 0_i64
+        i = 0
+        while i < count
+          total &+= min_d2[i]
+          i &+= 1
         end
-        i += 1
+
+        # Degenerate guard: if every point coincides with an already-
+        # picked center (only possible when k > unique_vectors), fall
+        # back to a uniform draw so the loop still terminates.
+        if total <= 0
+          picked = rng.rand(count)
+        else
+          threshold = rng.rand * total.to_f64
+          running = 0_i64
+          picked = count - 1
+          i = 0
+          while i < count
+            running &+= min_d2[i]
+            if running.to_f64 >= threshold
+              picked = i
+              break
+            end
+            i &+= 1
+          end
+        end
+
+        copy_vec_to_centroid(vectors, picked, centroids, c, dims)
+        update_min_d2!(min_d2, vectors, count, dims, vectors, picked)
+
+        if (c & 0x7F) == 0
+          STDERR.puts "[ivf] kmeans++ seeded #{c}/#{k}"
+          STDERR.flush
+        end
+        c += 1
+      end
+    end
+
+    private def self.copy_vec_to_centroid(vectors : Slice(Int16),
+                                          src_idx : Int32,
+                                          centroids : Slice(Float64),
+                                          dst_idx : Int32,
+                                          dims : Int32) : Nil
+      src = src_idx * dims
+      dst = dst_idx * dims
+      j = 0
+      while j < dims
+        centroids[dst + j] = vectors[src + j].to_f64
+        j += 1
+      end
+    end
+
+    # Update min_d2[i] := min(min_d2[i], ‖vectors[i] - ref_vectors[ref_idx]‖²).
+    # Same Int16→Int32→Int64 squared-L² shape as the runtime IVF kernel
+    # so LLVM lowers it to vpmaddwd ymm under --mcpu=haswell.
+    private def self.update_min_d2!(min_d2 : Slice(Int64),
+                                    vectors : Slice(Int16),
+                                    count : Int32,
+                                    dims : Int32,
+                                    ref_vectors : Slice(Int16),
+                                    ref_idx : Int32) : Nil
+      ref_off = ref_idx * dims
+      i = 0
+      while i < count
+        v_off = i * dims
+        d = 0_i64
+        j = 0
+        while j < dims
+          diff = vectors[v_off + j].to_i32 &- ref_vectors[ref_off + j].to_i32
+          d &+= (diff &* diff).to_i64
+          j &+= 1
+        end
+        min_d2[i] = d if d < min_d2[i]
+        i &+= 1
       end
     end
 

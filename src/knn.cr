@@ -39,16 +39,26 @@ module RinhaDeBackend
           j &+= 1
         end
 
-        if d < worst
-          # Insert into the sorted top-K via right-shift.
+        # Asymmetric tie-break (F1.4): fraud wins over legit on a tie.
+        # Mirrors `Ivf` so this brute-force reference and the IVF runtime
+        # agree on every query (the round-trip spec relies on exact
+        # equality between `Knn#fraud_count_top_k` and `Ivf#...`).
+        new_label = lab_ptr[i]
+        new_is_fraud = new_label == References::LABEL_FRAUD
+        tie_admit = new_is_fraud && d == worst && best_label[K &- 1] == References::LABEL_LEGIT
+        if d < worst || tie_admit
           slot = K - 1
-          while slot > 0 && best_dist[slot &- 1] > d
-            best_dist[slot]  = best_dist[slot &- 1]
-            best_label[slot] = best_label[slot &- 1]
+          while slot > 0
+            bd = best_dist[slot &- 1]
+            bl = best_label[slot &- 1]
+            shift = bd > d || (new_is_fraud && bd == d && bl == References::LABEL_LEGIT)
+            break unless shift
+            best_dist[slot]  = bd
+            best_label[slot] = bl
             slot &-= 1
           end
           best_dist[slot]  = d
-          best_label[slot] = lab_ptr[i]
+          best_label[slot] = new_label
           worst = best_dist[K &- 1]
         end
 

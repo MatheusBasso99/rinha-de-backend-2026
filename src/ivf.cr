@@ -227,15 +227,30 @@ module RinhaDeBackend
               j &+= 1
             end
 
-            if d < worst
+            # Asymmetric tie-break (F1.4): on equal distance, fraud wins
+            # over legit. The rinha score weights FN at 3× FP, so on a
+            # tie the expected-cost optimum is to surface the fraud.
+            # Effects: (a) admit a fraud at d == worst when the worst
+            # slot is legit; (b) when shifting, treat ties between a
+            # fraud incoming and a legit existing as "shift" too.
+            # Stays in the post-kernel insertion sort — the SIMD inner
+            # loop above is untouched.
+            new_label = lab_ptr[i]
+            new_is_fraud = new_label == References::LABEL_FRAUD
+            tie_admit = new_is_fraud && d == worst && best_label[TOPK &- 1] == References::LABEL_LEGIT
+            if d < worst || tie_admit
               slot = TOPK &- 1
-              while slot > 0 && best_dist[slot &- 1] > d
-                best_dist[slot]  = best_dist[slot &- 1]
-                best_label[slot] = best_label[slot &- 1]
+              while slot > 0
+                bd = best_dist[slot &- 1]
+                bl = best_label[slot &- 1]
+                shift = bd > d || (new_is_fraud && bd == d && bl == References::LABEL_LEGIT)
+                break unless shift
+                best_dist[slot]  = bd
+                best_label[slot] = bl
                 slot &-= 1
               end
               best_dist[slot]  = d
-              best_label[slot] = lab_ptr[i]
+              best_label[slot] = new_label
               worst = best_dist[TOPK &- 1]
             end
 
