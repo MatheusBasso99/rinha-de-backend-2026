@@ -47,27 +47,24 @@ module RinhaDeBackend
       spawn gc_stats_loop if GC_STATS_PERIOD > 0
 
       # Bind FIRST so the docker healthcheck (`test -S
-      # /sockets/api*.sock`) passes immediately. The Mac Mini Late 2014
-      # rig has a slow HDD; if the prefault loop runs before bind, the
-      # socket file might not appear inside the healthcheck grace
-      # (start_period + retries × interval), and `depends_on:
-      # service_healthy` brings the whole stack down. Bind takes
-      # microseconds; prefault can take much longer on cold cache.
-      server = @http.bind!
-
-      # Post-madvise warm-up touch. Brings every 4 KiB page into
-      # residence and gives khugepaged an opportunity to fold them into
-      # 2 MiB transparent huge pages, cutting TLB pressure during cold
-      # cluster scans. Runs after bind so the healthcheck observes the
-      # socket file ASAP; the kernel queues incoming UDS connections
-      # while we walk the mmap, and the LB doesn't start serving k6
-      # traffic until *its own* container is up (gated by api1/api2
-      # healthy).
-      t_pf = Time.instant
-      @refs.prefault!
-      log_phase "prefaulted references in #{(Time.instant - t_pf).total_milliseconds.round(1)}ms"
-
-      @http.accept!(server)
+      # /sockets/api*.sock`) passes immediately. Mac Mini Late 2014's
+      # slow HDD makes prefault!  measurably long on cold cache; if it
+      # ran before bind, the socket file might not appear inside the
+      # healthcheck grace (start_period + retries × interval), and
+      # `depends_on: service_healthy` would bring the whole stack
+      # down. Bind takes microseconds; prefault is heavy.
+      #
+      # The kernel queues incoming UDS connections in the backlog
+      # during the prefault window. The LB itself doesn't start
+      # accepting k6 traffic until the API healthchecks pass AND the
+      # LB's own container is up (gated by api1/api2 healthy), so by
+      # the time real requests arrive the accept loop is already
+      # running.
+      @http.listen do
+        t_pf = Time.instant
+        @refs.prefault!
+        log_phase "prefaulted references in #{(Time.instant - t_pf).total_milliseconds.round(1)}ms"
+      end
     end
 
     private def gc_stats_loop : Nil

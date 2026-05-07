@@ -81,13 +81,16 @@ module RinhaDeBackend
     def initialize(@host : String, @port : Int32, @vectorizer : Vectorizer, @ivf : Ivf, @uds_path : String? = nil)
     end
 
-    # Bind the listening socket. Returns the bound server so the caller
-    # can run any post-bind warm-up (e.g. prefault!) before entering
-    # the accept loop. Splitting bind from accept lets the docker
-    # healthcheck (`test -S /sockets/api*.sock`) pass as soon as the
-    # socket file appears, even if subsequent boot work takes a while
-    # on slow disks (Mac Mini Late 2014 HDD).
-    def bind! : Socket::Server
+    # Listen with an optional post-bind / pre-accept callback. The
+    # callback runs *after* the server socket is bound (so the docker
+    # healthcheck `test -S /sockets/api*.sock` already passes) and
+    # *before* the accept loop starts (so the caller can do heavy
+    # warm-up like `References#prefault!` without delaying the
+    # healthcheck). The kernel queues incoming UDS connections in the
+    # backlog while the callback runs; the LB itself doesn't start
+    # until the API healthcheck passes, so by the time real traffic
+    # arrives the accept loop is already up.
+    def listen(&post_bind : -> Nil) : Nil
       if path = @uds_path
         # Crystal's UNIXServer does NOT auto-delete a stale socket file;
         # `bind(2)` returns EADDRINUSE if it exists. The Rinha engine
@@ -96,28 +99,19 @@ module RinhaDeBackend
         File.delete(path) if File.exists?(path)
         uds = UNIXServer.new(path)
         log "listening on uds=#{path}"
-        uds
+        post_bind.call
+        accept_loop(uds)
       else
         tcp = TCPServer.new(@host, @port, reuse_port: false)
         tcp.reuse_address = true
         log "listening on #{@host}:#{@port}"
-        tcp
-      end
-    end
-
-    def accept!(server : Socket::Server) : Nil
-      case server
-      when UNIXServer
-        accept_loop(server)
-      when TCPServer
-        accept_loop(server)
-      else
-        raise "unsupported server type: #{server.class}"
+        post_bind.call
+        accept_loop(tcp)
       end
     end
 
     def listen : Nil
-      accept!(bind!)
+      listen { }
     end
 
     # Two overloads: the concrete-typed `accept` returns the matching
