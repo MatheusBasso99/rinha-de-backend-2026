@@ -64,6 +64,11 @@ module RinhaDeBackend
         t_pf = Time.instant
         @refs.prefault!
         log_phase "prefaulted references in #{(Time.instant - t_pf).total_milliseconds.round(1)}ms"
+        # T1.5 diagnostic: dump THP/RSS state for the references.bin
+        # region. Tells us whether AnonHugePages > 0 on the official
+        # rig (Ubuntu 24.04) — the missing piece of the local-vs-rig
+        # ×40 p99 gap. Off the hot path, runs once, no-op on macOS.
+        @refs.log_smaps!
       end
     end
 

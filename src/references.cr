@@ -233,6 +233,48 @@ module RinhaDeBackend
       @prefault_sink = sum
     end
 
+    # T1.5 diagnostic: locate the `references.bin` region in
+    # `/proc/self/smaps` and dump the lines that tell us whether THP
+    # actually backs the mapping (`AnonHugePages`, `FilePmdMapped`,
+    # `THPeligible`) plus prefault evidence (`Rss`) and the kernel's
+    # advice flags (`VmFlags hg`). One-shot at boot, off the hot path.
+    # No-op on macOS dev boxes (no /proc) and on non-mmap loaders.
+    def log_smaps! : Nil
+      return if @mmap_size <= 0 || @mmap_base.null?
+      return unless File.exists?("/proc/self/smaps")
+      keys = {
+        "Size:", "Rss:", "Pss:",
+        "AnonHugePages:", "FilePmdMapped:",
+        "Shared_Hugetlb:", "Private_Hugetlb:",
+        "THPeligible:", "VmFlags:",
+      }
+      in_region = false
+      File.open("/proc/self/smaps", "r") do |f|
+        f.each_line do |line|
+          # Region header: "<start>-<end> <perms> <offset> <dev> <inode> <path>"
+          if line.size >= 1 && hex_char?(line[0])
+            in_region = line.includes?("references.bin")
+            STDERR.puts "[references] smaps: #{line.rstrip}" if in_region
+          elsif in_region
+            keys.each do |k|
+              if line.starts_with?(k)
+                STDERR.puts "[references] smaps: #{line.rstrip}"
+                break
+              end
+            end
+          end
+        end
+      end
+      STDERR.flush
+    rescue ex
+      STDERR.puts "[references] smaps probe failed: #{ex.message}"
+      STDERR.flush
+    end
+
+    private def hex_char?(c : Char) : Bool
+      (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+    end
+
     # Builds the binary file by parsing JSON, running k-means and
     # writing all sections in order. `output_io` must be seekable.
     # Returns the number of records written.
