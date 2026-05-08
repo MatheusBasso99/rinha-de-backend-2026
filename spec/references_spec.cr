@@ -44,8 +44,13 @@ describe RinhaDeBackend::References do
       refs = RinhaDeBackend::References.mmap(bin_path)
       refs.count.should eq(100)
       refs.k.should eq(4)
-      refs.vectors.size.should eq(100 * RinhaDeBackend::References::DIMS)
-      refs.labels.size.should eq(100)
+      # padded_count >= count and <= count + k (one tail pad row per
+      # odd-sized cell). The vector/label slices follow padded_count
+      # since the kernel iterates over the padded layout.
+      refs.padded_count.should be >= 100
+      refs.padded_count.should be <= 100 + refs.k
+      refs.vectors.size.should eq(refs.padded_count * RinhaDeBackend::References::DIMS)
+      refs.labels.size.should eq(refs.padded_count)
       refs.centroids.size.should eq(4 * RinhaDeBackend::References::DIMS)
       refs.cell_offsets.size.should eq(5)
       # Bbox layout follows the row stride (DIMS = 16); each cell has
@@ -53,8 +58,13 @@ describe RinhaDeBackend::References do
       refs.bbox_min.size.should eq(4 * RinhaDeBackend::References::DIMS)
       refs.bbox_max.size.should eq(4 * RinhaDeBackend::References::DIMS)
 
-      # cell_offsets are cumulative: last entry must equal count.
-      refs.cell_offsets[4].should eq(100_u32)
+      # cell_offsets are cumulative: last entry must equal padded_count.
+      refs.cell_offsets[4].should eq(refs.padded_count.to_u32)
+      # Each cell must start at an even row index (= 64 B aligned for
+      # stride-16 Int16 rows).
+      5.times do |i|
+        (refs.cell_offsets[i] & 1_u32).should eq(0_u32)
+      end
       # Cells must be non-decreasing (sanity check on the layout).
       4.times do |i|
         refs.cell_offsets[i].should be <= refs.cell_offsets[i + 1]
@@ -79,7 +89,17 @@ describe RinhaDeBackend::References do
       ivf = RinhaDeBackend::Ivf.new(refs, base_nprobe: 4, retry_nprobe: 0)
 
       stride = RinhaDeBackend::References::DIMS
-      refs.count.times do |i|
+      pad_sentinel = RinhaDeBackend::IvfBuilder::PAD_SENTINEL
+      refs.padded_count.times do |i|
+        # Skip pad rows inserted to round each cell's start to a 64 B
+        # boundary: they carry `PAD_SENTINEL` on every lane, which
+        # produces a query the production vectorizer can never emit
+        # (real lanes live in [-10_000, 10_000]). On such an out-of-
+        # distribution query the IVF triangle/bbox prune is unsound
+        # because radius/bbox are computed over real rows only — but
+        # production never sees this case, so it's a spec-only quirk.
+        next if refs.vectors[i * stride] == pad_sentinel
+
         query = StaticArray(Int16, 16).new(0_i16)
         # Copy the 14 logical lanes — pad lanes stay 0, matching the
         # zero pad pinned in `references.bin`.

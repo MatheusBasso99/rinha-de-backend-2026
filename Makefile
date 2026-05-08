@@ -20,13 +20,17 @@ build:
 	crystal build src/main.cr -o rinha_de_backend
 
 release:
-	crystal build --release --no-debug --mcpu=haswell -o rinha_de_backend src/main.cr
+	crystal build --release --no-debug --mcpu=haswell \
+	  --mattr=+avx2,+fma,+bmi,+bmi2,+f16c,+movbe,+popcnt,+aes,+pclmul \
+	  -o rinha_de_backend src/main.cr
 
 lb:
 	crystal build -Dpreview_mt -Dexecution_context src/lb_main.cr -o rinha_lb
 
 lb-release:
-	crystal build --release --no-debug --mcpu=haswell -Dpreview_mt -Dexecution_context -o rinha_lb src/lb_main.cr
+	crystal build --release --no-debug --mcpu=haswell \
+	  --mattr=+avx2,+fma,+bmi,+bmi2,+f16c,+movbe,+popcnt,+aes,+pclmul \
+	  -Dpreview_mt -Dexecution_context -o rinha_lb src/lb_main.cr
 
 spec:
 	crystal spec

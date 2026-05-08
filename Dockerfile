@@ -48,6 +48,7 @@ RUN crystal build \
     --no-debug \
     --static \
     --mcpu=haswell \
+    --mattr=+avx2,+fma,+bmi,+bmi2,+f16c,+movbe,+popcnt,+aes,+pclmul \
     -o /build/rinha_de_backend \
     src/main.cr \
  && strip /build/rinha_de_backend
@@ -64,6 +65,7 @@ RUN crystal build \
     --no-debug \
     --static \
     --mcpu=haswell \
+    --mattr=+avx2,+fma,+bmi,+bmi2,+f16c,+movbe,+popcnt,+aes,+pclmul \
     -Dpreview_mt \
     -Dexecution_context \
     -o /build/rinha_lb \

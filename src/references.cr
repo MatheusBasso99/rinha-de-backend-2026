@@ -46,15 +46,18 @@ module RinhaDeBackend
   #
   # Binary file format (little-endian, x86_64):
   #
-  #   bytes  0..3   : magic "RNH5"   (bumped from RNH4 when stride went
-  #                                   14 → 16 for AVX2 VPMADDWD lanes)
-  #   bytes  4..7   : count u32
+  #   bytes  0..3   : magic "RNH6"   (bumped from RNH5 when each cell's
+  #                                   start row was aligned to 64 B with
+  #                                   optional pad rows at the tail)
+  #   bytes  4..7   : count u32 (real, unpadded — for stats / legacy)
   #   bytes  8..11  : dims  u32 (= 16, the row stride)
   #   bytes 12..15  : k     u32 (number of IVF cells)
   #   bytes 16..19  : max_cell_radius u32
-  #   bytes 20..63  : reserved (zeroed)
-  #   bytes 64..    : vectors (count * dims * Int16, reordered by cell)
-  #   then          : labels  (count * UInt8, reordered by cell)
+  #   bytes 20..23  : padded_count u32 (>= count, <= count + k)
+  #   bytes 24..63  : reserved (zeroed)
+  #   bytes 64..    : vectors (padded_count * dims * Int16, reordered by
+  #                            cell, each cell at an even row index)
+  #   then          : labels  (padded_count * UInt8, reordered by cell)
   #   then          : centroids (k * dims * Int16)
   #   then          : cell_offsets ((k + 1) * UInt32)
   #   then          : cell_radius (k * UInt32)
@@ -80,9 +83,15 @@ module RinhaDeBackend
     DEFAULT_CAPACITY = 3_000_000
 
     HEADER_SIZE  =     64
-    HEADER_MAGIC = "RNH5"
+    HEADER_MAGIC = "RNH6"
 
     getter count : Int32
+    # Number of rows in `vectors` / `labels`. Equals `count` for the
+    # gzip-JSON loader (no IVF, no padding); for the IVF mmap path it can
+    # be up to `count + k` to keep each cell's start row at a 64 B
+    # boundary. Pad rows carry `IvfBuilder::PAD_SENTINEL` per lane and
+    # are guaranteed never to enter the top-5 ranking.
+    getter padded_count : Int32
     getter vectors : Slice(Int16)
     getter labels : Slice(UInt8)
     getter k : Int32
@@ -107,6 +116,7 @@ module RinhaDeBackend
     private def initialize(@count : Int32,
                            @vectors : Slice(Int16),
                            @labels : Slice(UInt8),
+                           @padded_count : Int32,
                            @k : Int32 = 0,
                            @centroids : Slice(Int16) = Slice(Int16).new(0, 0_i16),
                            @cell_offsets : Slice(UInt32) = Slice(UInt32).new(0, 0_u32),
@@ -167,11 +177,13 @@ module RinhaDeBackend
       dims  = (base + 8).as(UInt32*).value.to_i32
       k     = (base + 12).as(UInt32*).value.to_i32
       max_cell_radius = (base + 16).as(UInt32*).value
+      padded_count = (base + 20).as(UInt32*).value.to_i32
       raise "dims mismatch in #{path}: #{dims} != #{DIMS} (rebuild references.bin — header expects stride #{DIMS})" unless dims == DIMS
+      raise "padded_count (#{padded_count}) < count (#{count}) in #{path}" if padded_count < count
 
       vectors_off      = HEADER_SIZE
-      labels_off       = vectors_off + count * DIMS * sizeof(Int16)
-      centroids_off    = labels_off + count * sizeof(UInt8)
+      labels_off       = vectors_off + padded_count * DIMS * sizeof(Int16)
+      centroids_off    = labels_off + padded_count * sizeof(UInt8)
       cell_offsets_off = centroids_off + k * DIMS * sizeof(Int16)
       cell_radius_off  = cell_offsets_off + (k + 1) * sizeof(UInt32)
       bbox_min_off     = cell_radius_off + k * sizeof(UInt32)
@@ -187,16 +199,17 @@ module RinhaDeBackend
       bbox_min_ptr     = (base + bbox_min_off).as(Int16*)
       bbox_max_ptr     = (base + bbox_max_off).as(Int16*)
 
-      vectors      = Slice(Int16).new(vectors_ptr, count * DIMS, read_only: true)
-      labels       = Slice(UInt8).new(labels_ptr, count, read_only: true)
+      vectors      = Slice(Int16).new(vectors_ptr, padded_count * DIMS, read_only: true)
+      labels       = Slice(UInt8).new(labels_ptr, padded_count, read_only: true)
       centroids    = Slice(Int16).new(centroids_ptr, k * DIMS, read_only: true)
       cell_offsets = Slice(UInt32).new(cell_offsets_ptr, k + 1, read_only: true)
       cell_radius  = Slice(UInt32).new(cell_radius_ptr, k, read_only: true)
       bbox_min     = Slice(Int16).new(bbox_min_ptr, k * DIMS, read_only: true)
       bbox_max     = Slice(Int16).new(bbox_max_ptr, k * DIMS, read_only: true)
 
-      new(count, vectors, labels, k, centroids, cell_offsets, cell_radius,
-          max_cell_radius, bbox_min, bbox_max, base, size_i64.to_i64)
+      new(count, vectors, labels, padded_count, k, centroids, cell_offsets,
+          cell_radius, max_cell_radius, bbox_min, bbox_max, base,
+          size_i64.to_i64)
     end
 
     # Walk the mmapped region, reading one byte every 4 KiB to force the
@@ -254,6 +267,7 @@ module RinhaDeBackend
       output_io.write_bytes(DIMS.to_u32, IO::ByteFormat::LittleEndian)
       output_io.write_bytes(k.to_u32, IO::ByteFormat::LittleEndian)
       output_io.write_bytes(result.max_cell_radius, IO::ByteFormat::LittleEndian)
+      output_io.write_bytes(result.padded_count.to_u32, IO::ByteFormat::LittleEndian)
 
       raw.count
     end
@@ -323,7 +337,9 @@ module RinhaDeBackend
         labels  = trimmed_labels
       end
 
-      new(i, vectors, labels)
+      # No IVF on this path → no padding; padded_count == count so the
+      # invariant `vectors.size == padded_count * DIMS` holds.
+      new(i, vectors, labels, i)
     end
   end
 end

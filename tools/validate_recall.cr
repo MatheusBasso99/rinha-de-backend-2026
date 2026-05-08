@@ -192,7 +192,10 @@ module RinhaDeBackend
     end
 
     t0 = Time.instant
-    bf = brute_topk(query_buf, REFS.vectors, REFS.count)
+    # Brute scan iterates the padded slice — pad rows carry
+    # `Int16::MAX` lanes whose squared-L2 dwarfs any real worst case, so
+    # they never enter the top-5 and the comparison with IVF stays exact.
+    bf = brute_topk(query_buf, REFS.vectors, REFS.padded_count)
     t1 = Time.instant
     iv = ivf_topk(query_buf, REFS, NPROBE)
     t2 = Time.instant

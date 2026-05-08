@@ -16,20 +16,42 @@ module RinhaDeBackend
     DEFAULT_ITERATIONS =   12
     DEFAULT_SEED       =   42_u64
 
+    # Sentinel lane value used by pad rows inserted at the tail of an
+    # odd-sized cell to keep `cell_offsets[c+1]` even (= 64 B aligned for
+    # stride-16 Int16 rows). Any query lane lives in [-10_000, 10_000];
+    # `(query - Int16::MAX)²` per lane × 14 logical dims dominates any
+    # real worst-case L2², so a pad row can never enter the top-5 ranking
+    # and the kernel is free to read past the last real row of a cell.
+    PAD_SENTINEL = Int16::MAX
+
     record Result,
-      vectors : Slice(Int16),         # count * dims, reordered by cell
-      labels : Slice(UInt8),          # count, reordered by cell
+      vectors : Slice(Int16),         # padded_count * dims, reordered by cell;
+                                      # each cell starts at an even row index
+                                      # (= 64 B aligned for stride-16 Int16
+                                      # rows) and may carry one pad row of
+                                      # `PAD_SENTINEL` per lane at its tail.
+      labels : Slice(UInt8),          # padded_count, reordered by cell. Pad
+                                      # rows carry label 0 (irrelevant since
+                                      # they never enter top-5).
+      padded_count : Int32,           # vectors.size / dims; >= count, <= count + k
       centroids : Slice(Int16),       # k * dims, quantized in vector scale
       cell_offsets : Slice(UInt32),   # k+1 entries; cell c spans [off[c]..off[c+1])
+                                      # with off[c] always even. The range may
+                                      # include a single pad row at off[c+1]-1
+                                      # when cell c had odd real size.
       cell_radius : Slice(UInt32),    # k entries; max non-squared L2 distance
                                       # from quantized centroid c to any vector
                                       # in cell c (ceil). Used at query time for
-                                      # triangle-inequality pruning.
+                                      # triangle-inequality pruning. Computed
+                                      # over the cell's real rows only — pad
+                                      # rows would explode the radius.
       max_cell_radius : UInt32,       # max(cell_radius) — global outer-break bound
       bbox_min : Slice(Int16),        # k * dims; per-cell axis-aligned bounding
-                                      # box minimum per dimension.
+                                      # box minimum per dimension. Computed over
+                                      # real rows only (pad rows excluded).
       bbox_max : Slice(Int16)         # k * dims; per-cell axis-aligned bounding
-                                      # box maximum per dimension.
+                                      # box maximum per dimension. Computed over
+                                      # real rows only (pad rows excluded).
 
     def self.build(vectors : Slice(Int16),
                    labels : Slice(UInt8),
@@ -62,7 +84,12 @@ module RinhaDeBackend
       # Final assignment after the last centroid move.
       assign_all!(centroids, vectors, count, dims, k, assignments)
 
-      # Cell sizes → cumulative offsets.
+      # Cell sizes → cumulative offsets, with each cell's start rounded up
+      # to an even row index. Stride is `dims = 16` Int16 lanes = 32 B per
+      # row, so an even start row lands on a 64 B boundary — the natural
+      # alignment for a `vmovdqa ymm` load on Haswell. The padding adds
+      # at most one row per non-empty odd-sized cell (≤ k pad rows total,
+      # ≤ k * dims * 2 ≈ 64 KiB for k=2048).
       cell_sizes = Slice(Int32).new(k, 0)
       i = 0
       while i < count
@@ -75,14 +102,20 @@ module RinhaDeBackend
       c = 0
       while c < k
         cell_offsets[c] = acc
-        acc += cell_sizes[c].to_u32
+        acc &+= cell_sizes[c].to_u32
+        # Round up to next even row → 64 B alignment for the next cell's
+        # first row. The slot at `acc` (when bumped) is the pad row.
+        acc = (acc &+ 1_u32) & ~1_u32
         c += 1
       end
       cell_offsets[k] = acc
+      padded_count = acc.to_i32
 
-      # Reorder vectors and labels by cell.
-      reordered_vectors = Slice(Int16).new(count * dims, 0_i16)
-      reordered_labels  = Slice(UInt8).new(count, 0_u8)
+      # Reorder vectors and labels by cell. The slices are sized to
+      # `padded_count`; pad slots get `PAD_SENTINEL` per lane (label 0)
+      # below, after real data has been placed.
+      reordered_vectors = Slice(Int16).new(padded_count * dims, 0_i16)
+      reordered_labels  = Slice(UInt8).new(padded_count, 0_u8)
       cursor = Slice(UInt32).new(k, 0_u32)
 
       i = 0
@@ -100,6 +133,27 @@ module RinhaDeBackend
         end
         reordered_labels[pos] = labels[i]
         i += 1
+      end
+
+      # Stamp pad rows. For each cell whose real size is odd, slot
+      # `cell_offsets[c] + cell_sizes[c]` is one row before
+      # `cell_offsets[c+1]` and carries `PAD_SENTINEL` on every lane.
+      # Reading it through the IVF kernel produces a squared-L2 of
+      # ≈ 14 × (PAD_SENTINEL - max_query_lane)² ≫ any real worst-case
+      # distance, so the row can never enter the top-5.
+      c = 0
+      while c < k
+        real_end = (cell_offsets[c] &+ cell_sizes[c].to_u32).to_i32
+        pad_end  = cell_offsets[c &+ 1].to_i32
+        if real_end < pad_end
+          target = real_end * dims
+          d = 0
+          while d < dims
+            reordered_vectors[target + d] = PAD_SENTINEL
+            d += 1
+          end
+        end
+        c += 1
       end
 
       # Quantize centroids back to Int16.
@@ -133,7 +187,11 @@ module RinhaDeBackend
       while c < k
         c_off = c * dims
         start = cell_offsets[c].to_i32
-        stop  = cell_offsets[c + 1].to_i32
+        # Real-row stop: cell_offsets[c+1] may include one pad row at the
+        # tail; bbox/radius must not see pad sentinels (their `Int16::MAX`
+        # lanes would torpedo every triangle/bbox prune). The pad row, if
+        # present, sits one slot below `cell_offsets[c+1]`.
+        stop  = (cell_offsets[c].to_i32 + cell_sizes[c])
         max_sq = 0_i64
 
         # Initialize the bbox to the first vector (or sentinel-safe values
@@ -188,8 +246,8 @@ module RinhaDeBackend
         c += 1
       end
 
-      Result.new(reordered_vectors, reordered_labels, centroids_i16,
-                 cell_offsets, cell_radius, max_cell_radius,
+      Result.new(reordered_vectors, reordered_labels, padded_count,
+                 centroids_i16, cell_offsets, cell_radius, max_cell_radius,
                  bbox_min, bbox_max)
     end
 

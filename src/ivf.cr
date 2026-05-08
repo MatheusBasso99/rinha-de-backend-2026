@@ -81,6 +81,18 @@ module RinhaDeBackend
     # In the common path (frauds ∈ {0, 1, 4, 5}) the retry is skipped
     # entirely — mean/p50 latency drops ~2× vs the previous always-16
     # baseline.
+    #
+    # `@[AlwaysInline]` lets the optimizer fold the whole probe into
+    # `handle_fraud_score` so register/spill decisions are made across
+    # the request boundary. `@[TargetFeature]` is **deliberately not
+    # used** here: Crystal's codegen treats any `target_features` /
+    # `target_cpu` override as a hard inlining boundary
+    # (`compiler/crystal/codegen/fun.cr` adds `LLVM::Attribute::NoInline`
+    # whenever those are set), which would silently cancel the
+    # `AlwaysInline` we want. The global `--mcpu=haswell` /
+    # `--mattr=+avx2,+fma,+bmi2,...` build flags already give the
+    # kernel the same Haswell ISA, without the inlining penalty.
+    @[AlwaysInline]
     def fraud_count_top_k(query : StaticArray(Int16, 16)) : Int32
       vectors         = @refs.vectors
       labels          = @refs.labels

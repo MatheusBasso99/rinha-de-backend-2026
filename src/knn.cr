@@ -15,7 +15,12 @@ module RinhaDeBackend
     def fraud_count_top_k(query : StaticArray(Int16, 16)) : Int32
       vectors = @refs.vectors
       labels  = @refs.labels
-      count   = @refs.count
+      # Iterate the padded slice (real rows + per-cell pad rows). Pad rows
+      # carry `IvfBuilder::PAD_SENTINEL` per lane and are guaranteed to
+      # produce a squared-L2 well above any worst-case real distance, so
+      # they cannot enter the top-5 — brute-force agrees with `Ivf` to
+      # the bit, which the round-trip spec relies on.
+      count   = @refs.padded_count
       dims    = References::DIMS
 
       # Top-K parallel arrays, kept sorted ascending by distance.

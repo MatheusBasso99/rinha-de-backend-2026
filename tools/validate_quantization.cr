@@ -197,7 +197,11 @@ module RinhaDeBackend
     t0 = Time.instant
     f64_picks = brute_topk_f64(query_f64, f64_vectors, f64_count)
     t1 = Time.instant
-    i16_picks = brute_topk_i16(query_i16, i16_refs.vectors, i16_refs.count)
+    # `padded_count` includes per-cell pad rows whose `Int16::MAX` lanes
+    # produce a squared-L2 well above any real worst-case, so they can't
+    # enter the top-5 — brute-forcing over the full padded slice keeps
+    # the comparison with f64 honest while matching what `Knn` does.
+    i16_picks = brute_topk_i16(query_i16, i16_refs.vectors, i16_refs.padded_count)
     t2 = Time.instant
 
     f64_total_ms += (t1 - t0).total_milliseconds

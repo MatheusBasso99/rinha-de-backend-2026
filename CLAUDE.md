@@ -103,14 +103,25 @@ table. Update it when behavior changes — `CLAUDE.md` is the contract.
 
 | section | type | size |
 |---|---|---|
-| header | `"RNH4"` magic + `count u32` + `dims u32` + `k u32` + `max_cell_radius u32` + 44 B padding | 64 B |
-| vectors | `count × dims × Int16` reordered by cell | ~84 MiB |
-| labels | `count × UInt8` (0=legit, 1=fraud) | ~3 MiB |
+| header | `"RNH6"` magic + `count u32` + `dims u32` + `k u32` + `max_cell_radius u32` + `padded_count u32` + 40 B padding | 64 B |
+| vectors | `padded_count × dims × Int16`, reordered by cell, each cell starts at an even row index (= 64 B aligned) | ~84 MiB |
+| labels | `padded_count × UInt8` (0=legit, 1=fraud) | ~3 MiB |
 | centroids | `k × dims × Int16` | ~57.3 KiB |
-| cell offsets | `(k + 1) × UInt32` | ~8.2 KiB |
+| cell offsets | `(k + 1) × UInt32`, every entry even | ~8.2 KiB |
 | cell radii | `k × UInt32` | ~8 KiB |
 | bbox min | `k × dims × Int16` | ~57.3 KiB |
 | bbox max | `k × dims × Int16` | ~57.3 KiB |
+
+`padded_count` is `count` plus up to one tail pad row per odd-sized cell
+(≤ k extra rows ≈ 64 KiB at k=2048). Pad rows carry
+`IvfBuilder::PAD_SENTINEL = Int16::MAX` on every lane so they cannot
+enter the top-5 ranking for any production query — real lanes live in
+[-10000, 10000], so the per-lane diff² ≥ 22767² × 14 dominates any real
+worst case. The sentinel keeps brute-force loaders that walk the slice
+linearly correct without needing to skip pads. `cell_radius` and the
+bbox are computed over real rows only (pad rows would torpedo every
+triangle / bbox prune); the runtime kernel iterates the full padded
+range per cell, but the prune logic stays sound.
 
 Total: **~84 MiB**, mmaped at boot with `MAP_POPULATE` so the first
 request doesn't pay page-fault cost. `prefault!` walks one byte every
