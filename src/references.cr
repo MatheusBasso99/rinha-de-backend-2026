@@ -251,8 +251,12 @@ module RinhaDeBackend
       in_region = false
       File.open("/proc/self/smaps", "r") do |f|
         f.each_line do |line|
-          # Region header: "<start>-<end> <perms> <offset> <dev> <inode> <path>"
-          if line.size >= 1 && hex_char?(line[0])
+          # Region header: "<hex>-<hex> <perms> <offset> <dev> <inode> <path>"
+          # Detect by the literal "-" between two hex runs, not by the
+          # first char alone — metric keys like "Anonymous:" start with
+          # 'A', which is a valid hex char and would silently flip
+          # in_region off.
+          if region_header?(line)
             in_region = line.includes?("references.bin")
             STDERR.puts "[references] smaps: #{line.rstrip}" if in_region
           elsif in_region
@@ -271,8 +275,36 @@ module RinhaDeBackend
       STDERR.flush
     end
 
-    private def hex_char?(c : Char) : Bool
-      (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+    # True if `line` looks like an smaps region header
+    # ("<hex>+-<hex>+ <perms> ..."): all hex up to the first '-', then
+    # at least one hex after, then a space. Cheap, no regex.
+    private def region_header?(line : String) : Bool
+      i = 0
+      n = line.bytesize
+      return false if n == 0
+      while i < n
+        c = line.to_unsafe[i]
+        break if c == 0x2d_u8 # '-'
+        return false unless hex_byte?(c)
+        i += 1
+      end
+      return false if i == 0 || i >= n
+      i += 1 # skip '-'
+      hex_after = 0
+      while i < n
+        c = line.to_unsafe[i]
+        break unless hex_byte?(c)
+        hex_after += 1
+        i += 1
+      end
+      return false if hex_after == 0 || i >= n
+      line.to_unsafe[i] == 0x20_u8 # space
+    end
+
+    private def hex_byte?(b : UInt8) : Bool
+      (b >= 0x30_u8 && b <= 0x39_u8) || # '0'..'9'
+        (b >= 0x61_u8 && b <= 0x66_u8) || # 'a'..'f'
+        (b >= 0x41_u8 && b <= 0x46_u8)    # 'A'..'F'
     end
 
     # Builds the binary file by parsing JSON, running k-means and
