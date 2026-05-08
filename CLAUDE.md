@@ -18,6 +18,41 @@ This project is the submission for **Rinha de Backend 2026** using **Crystal lan
 - **Crystal GC module**: https://crystal-lang.org/api/1.20.1/GC.html
   (used by the GC strategy below).
 
+## Project working notes (read these before iterating)
+
+Living documents at the repo root — consult the relevant one before
+proposing changes in its area, and update it after landing the change.
+
+- **`SUBMISSION.md`** *(checked in)* — end-to-end submission flow:
+  pre-submission validation gates, `docker buildx` for `linux/amd64`,
+  publishing to `ghcr.io/matheusbasso99/rinha-de-backend-2026`, syncing
+  the `submission` branch (compose-only artifacts), and opening the
+  `rinha/test` issue. The single source of truth for "how do I ship
+  this iteration".
+- **`OFICIAL_RESULTS.md`** *(gitignored, local-only)* — **ground truth**.
+  Each entry pins the **commit + image tag** that ran on the official
+  Mac Mini Late 2014, the bot's raw JSON result, and the **delta vs the
+  matching `RESULTS.md` entry** (= the Apple-Silicon-Rosetta vs
+  Haswell-U gap). Read this before deciding which optimisation is worth
+  the next official run.
+- **`RESULTS.md`** *(gitignored, local-only)* — local k6 benchmark log
+  on M-series + Docker `linux/amd64` (Rosetta). Each iteration records
+  configuration, measurement, and delta vs the previous iteration.
+  Subjective under emulation — useful for relative comparisons between
+  iterations, **not** for predicting the official score (use
+  `OFICIAL_RESULTS.md` for that).
+- **`FP_FN_TODO.md`** *(gitignored, local-only)* — backlog for reducing
+  False Positives / False Negatives (`score_det`). Tiers ordered by
+  expected `E = 1·FP + 3·FN + 5·Err` reduction per unit latency cost.
+  Status header tracks whether detection is currently saturated at the
+  +3000 ceiling on the official rig (if so, items here score zero until
+  a regression brings `E` back above zero).
+- **`PERFORMANCE_TODO.md`** *(gitignored, local-only)* — backlog for
+  reducing p99 (`score_p99`) on the official Haswell-U target. Tiers
+  ordered by expected p99 win per hour of effort, with explicit Haswell
+  vs modern-OOO caveats. Read this before any micro-optimisation
+  proposal.
+
 ## Challenge theme
 
 Build the **`fraud-score`** module: for each transaction, transform the payload
