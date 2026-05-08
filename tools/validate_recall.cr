@@ -3,8 +3,14 @@ require "../src/references"
 # Validate IVF recall vs brute-force.
 #
 # Samples N vectors from the mmapped references.bin, computes brute-force
-# top-5 (over the full 3M Int16 dataset) and IVF top-5 (with nprobe=16),
-# reports recall@5 = |intersection| / 5 averaged across the sample.
+# top-5 (over the full 3M Int16 dataset, walking the AOSOA-8 block layout)
+# and IVF top-5 (with nprobe=16), reports recall@5 = |intersection| / 5
+# averaged across the sample.
+#
+# Indices returned by both functions are GLOBAL SLOT INDICES
+# (block_idx * 8 + slot). Pad slots / alignment-pad blocks carry
+# `IvfBuilder::PAD_SENTINEL` per lane, so they cannot enter top-5 against
+# any production-shaped query — the comparison stays exact.
 #
 # Usage: crystal run --release tools/validate_recall.cr -- [N] [NPROBE] [SEED]
 
@@ -20,58 +26,76 @@ module RinhaDeBackend
 
   STDERR.puts "[recall] count=#{REFS.count} k=#{REFS.k} nprobe=#{NPROBE} samples=#{N_QUERY} seed=#{SEED} jitter=#{(ENV["JITTER"]? || "0").to_i}"
 
-  # Brute-force top-K returning indices (sorted by distance asc).
+  SLOTS_PER_BLOCK = References::SLOTS_PER_BLOCK
+  LOGICAL_DIMS    = References::LOGICAL_DIMS
+  BLOCK_LANES     = References::BLOCK_LANES
+
+  # Brute-force top-K returning global slot indices (sorted by distance asc).
+  # Walks the AOSOA-8 block layout: 8 partial sums per block, dim-interleaved.
   def self.brute_topk(query : Slice(Int16),
-                      vectors : Slice(Int16),
-                      count : Int32) : StaticArray(Int32, 5)
+                      blocks : Slice(Int16),
+                      block_count : Int32) : StaticArray(Int32, 5)
     best_dist = StaticArray(Int64, 5).new(Int64::MAX)
     best_idx  = StaticArray(Int32, 5).new(-1)
     worst = Int64::MAX
 
-    vec_ptr   = vectors.to_unsafe
+    blk_ptr   = blocks.to_unsafe
     query_ptr = query.to_unsafe
 
-    i = 0
-    while i < count
-      offset = i * DIMS
-      d = 0_i64
-      j = 0
-      while j < DIMS
-        diff = query_ptr[j].to_i32 - vec_ptr[offset + j].to_i32
-        d &+= (diff &* diff).to_i64
-        break if d >= worst
-        j &+= 1
-      end
+    b = 0
+    while b < block_count
+      block_origin = b &* BLOCK_LANES
+      partial = StaticArray(Int64, 8).new(0_i64)
 
-      if d < worst
-        slot = K - 1
-        while slot > 0 && best_dist[slot &- 1] > d
-          best_dist[slot] = best_dist[slot &- 1]
-          best_idx[slot]  = best_idx[slot &- 1]
-          slot &-= 1
+      d = 0
+      while d < LOGICAL_DIMS
+        base = d &* SLOTS_PER_BLOCK
+        qd = query_ptr[d].to_i32
+        s = 0
+        while s < SLOTS_PER_BLOCK
+          diff = blk_ptr[block_origin &+ base &+ s].to_i32 &- qd
+          partial[s] &+= (diff &* diff).to_i64
+          s &+= 1
         end
-        best_dist[slot] = d
-        best_idx[slot]  = i
-        worst = best_dist[K &- 1]
+        d &+= 1
       end
 
-      i &+= 1
+      slot_global_base = b &* SLOTS_PER_BLOCK
+      slot = 0
+      while slot < SLOTS_PER_BLOCK
+        dst = partial[slot]
+        if dst < worst
+          ins = K - 1
+          while ins > 0 && best_dist[ins &- 1] > dst
+            best_dist[ins] = best_dist[ins &- 1]
+            best_idx[ins]  = best_idx[ins &- 1]
+            ins &-= 1
+          end
+          best_dist[ins] = dst
+          best_idx[ins]  = slot_global_base &+ slot
+          worst = best_dist[K &- 1]
+        end
+        slot &+= 1
+      end
+
+      b &+= 1
     end
 
     best_idx
   end
 
-  # IVF top-K returning indices (top-K within the union of the nearest
-  # `nprobe` cells). Mirrors src/ivf.cr but stores indices, not labels.
+  # IVF top-K returning global slot indices (top-K within the union of
+  # the nearest `nprobe` cells). Mirrors src/ivf.cr structure but stores
+  # indices, not labels.
   def self.ivf_topk(query : Slice(Int16),
                     refs : References,
                     nprobe : Int32) : StaticArray(Int32, 5)
-    vectors      = refs.vectors
+    blocks       = refs.blocks
     centroids    = refs.centroids
     cell_offsets = refs.cell_offsets
     k            = refs.k
 
-    vec_ptr   = vectors.to_unsafe
+    blk_ptr   = blocks.to_unsafe
     cent_ptr  = centroids.to_unsafe
     query_ptr = query.to_unsafe
 
@@ -115,34 +139,46 @@ module RinhaDeBackend
     p = 0
     while p < nprobe
       cell  = probe_cell[p]
-      start = cell_offsets[cell].to_i32
-      stop  = cell_offsets[cell &+ 1].to_i32
+      start_block = cell_offsets[cell].to_i32
+      stop_block  = cell_offsets[cell &+ 1].to_i32
 
-      i = start
-      while i < stop
-        off = i * DIMS
-        d = 0_i64
-        j = 0
-        while j < DIMS
-          diff = query_ptr[j].to_i32 - vec_ptr[off + j].to_i32
-          d &+= (diff &* diff).to_i64
-          break if d >= worst
-          j &+= 1
-        end
+      b = start_block
+      while b < stop_block
+        block_origin = b &* BLOCK_LANES
+        partial = StaticArray(Int64, 8).new(0_i64)
 
-        if d < worst
-          slot = K &- 1
-          while slot > 0 && best_dist[slot &- 1] > d
-            best_dist[slot] = best_dist[slot &- 1]
-            best_idx[slot]  = best_idx[slot &- 1]
-            slot &-= 1
+        d = 0
+        while d < LOGICAL_DIMS
+          base = d &* SLOTS_PER_BLOCK
+          qd = query_ptr[d].to_i32
+          s = 0
+          while s < SLOTS_PER_BLOCK
+            diff = blk_ptr[block_origin &+ base &+ s].to_i32 &- qd
+            partial[s] &+= (diff &* diff).to_i64
+            s &+= 1
           end
-          best_dist[slot] = d
-          best_idx[slot]  = i
-          worst = best_dist[K &- 1]
+          d &+= 1
         end
 
-        i &+= 1
+        slot_global_base = b &* SLOTS_PER_BLOCK
+        slot = 0
+        while slot < SLOTS_PER_BLOCK
+          dst = partial[slot]
+          if dst < worst
+            ins = K &- 1
+            while ins > 0 && best_dist[ins &- 1] > dst
+              best_dist[ins] = best_dist[ins &- 1]
+              best_idx[ins]  = best_idx[ins &- 1]
+              ins &-= 1
+            end
+            best_dist[ins] = dst
+            best_idx[ins]  = slot_global_base &+ slot
+            worst = best_dist[K &- 1]
+          end
+          slot &+= 1
+        end
+
+        b &+= 1
       end
 
       p &+= 1
@@ -151,11 +187,38 @@ module RinhaDeBackend
     best_idx
   end
 
+  # Pull a query out of slot `idx` within the AOSOA-8 block layout.
+  # `idx` is a global slot index = block_idx * 8 + slot_in_block.
+  def self.read_slot(blocks : Slice(Int16), idx : Int32, out_buf : Slice(Int16)) : Nil
+    block_idx = idx // SLOTS_PER_BLOCK
+    slot      = idx - block_idx * SLOTS_PER_BLOCK
+    block_origin = block_idx * BLOCK_LANES
+    j = 0
+    while j < LOGICAL_DIMS
+      out_buf[j] = blocks[block_origin + j * SLOTS_PER_BLOCK + slot]
+      j += 1
+    end
+    while j < DIMS
+      out_buf[j] = 0_i16
+      j += 1
+    end
+  end
+
+  # Sample slot indices, biased to skip pad slots (cells with sparse
+  # last block / alignment pads). We pick a random global slot, then
+  # check the first lane: if it's `Int16::MAX` we redraw. Pads are at
+  # most ~k * 8 / total_slots ≪ 1% so this is statistically cheap.
+  def self.sample_real_slot(blocks : Slice(Int16), padded_count : Int32, rng : Random) : Int32
+    loop do
+      idx = rng.rand(padded_count)
+      block_idx = idx // SLOTS_PER_BLOCK
+      slot      = idx - block_idx * SLOTS_PER_BLOCK
+      lane0 = blocks[block_idx * BLOCK_LANES + slot] # dim 0 lane for this slot
+      return idx unless lane0 == Int16::MAX
+    end
+  end
+
   # ----- Main -----
-  # `noise` (env JITTER, default 0) adds Int16 jitter in [-jitter..+jitter] to
-  # each query dimension. 0 = exact in-set queries (baseline). Try a few
-  # 100-300 values to simulate realistic /fraud-score traffic that does not
-  # land on a known data point.
   jitter = (ENV["JITTER"]? || "0").to_i
 
   rng = Random.new(SEED)
@@ -165,37 +228,28 @@ module RinhaDeBackend
   perfect         = 0
   partial         = 0
   worst_recall    = 1.0
-  histogram       = StaticArray(Int32, 6).new(0) # bucket = #intersection (0..5)
+  histogram       = StaticArray(Int32, 6).new(0)
   bf_total_ms     = 0.0
   ivf_total_ms    = 0.0
 
   N_QUERY.times do |i|
-    idx = rng.rand(REFS.count)
-    src = idx * DIMS
-    j = 0
-    # Logical lanes get optional jitter; pad lanes (DIMS-2..DIMS) are
-    # pinned to 0 to match the on-disk row layout — jittering them
-    # would model a query the vectorizer can't produce.
-    while j < References::LOGICAL_DIMS
-      v = REFS.vectors[src + j].to_i32
-      if jitter > 0
+    idx = sample_real_slot(REFS.blocks, REFS.padded_count, rng)
+    read_slot(REFS.blocks, idx, query_buf)
+
+    if jitter > 0
+      j = 0
+      while j < References::LOGICAL_DIMS
+        v = query_buf[j].to_i32
         v += rng.rand(-jitter..jitter)
         v = Int16::MIN.to_i32 if v < Int16::MIN
         v = Int16::MAX.to_i32 if v > Int16::MAX
+        query_buf[j] = v.to_i16
+        j += 1
       end
-      query_buf[j] = v.to_i16
-      j += 1
-    end
-    while j < DIMS
-      query_buf[j] = 0_i16
-      j += 1
     end
 
     t0 = Time.instant
-    # Brute scan iterates the padded slice — pad rows carry
-    # `Int16::MAX` lanes whose squared-L2 dwarfs any real worst case, so
-    # they never enter the top-5 and the comparison with IVF stays exact.
-    bf = brute_topk(query_buf, REFS.vectors, REFS.padded_count)
+    bf = brute_topk(query_buf, REFS.blocks, REFS.block_count)
     t1 = Time.instant
     iv = ivf_topk(query_buf, REFS, NPROBE)
     t2 = Time.instant
@@ -203,7 +257,6 @@ module RinhaDeBackend
     bf_total_ms  += (t1 - t0).total_milliseconds
     ivf_total_ms += (t2 - t1).total_milliseconds
 
-    # |intersection| of the two top-5 index sets.
     inter = 0
     a = 0
     while a < K

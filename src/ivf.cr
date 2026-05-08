@@ -1,22 +1,21 @@
 require "./references"
 
 module RinhaDeBackend
-  # IVF runtime query. Reads the centroids, cell offsets and reordered
-  # vectors that were produced by `IvfBuilder` and serialized into the
-  # mmapped binary file.
+  # IVF runtime query against the AOSOA-8 dim-interleaved block layout
+  # produced by `IvfBuilder`. Reads the centroids, cell-to-block offsets,
+  # and the block-major reference data through the mmapped binary file.
   #
   # Query algorithm:
   #
   #   1. Compute distance from `query` to each of the `k` centroids.
   #   2. Pick the `nprobe` nearest centroids.
-  #   3. Linearly scan the vectors in those `nprobe` cells with the
-  #      same insertion-sorted top-K + early-exit pattern used by
-  #      `Knn`.
+  #   3. Scan the blocks in those `nprobe` cells with the multi-stage
+  #      AOSOA-8 inner kernel + insertion-sorted top-K.
   #
   # Three cell-level early-exits are applied between cells:
   #
-  #   a. **Triangle-inequality pruning.** For each probed cell
-  #      `c` with centroid distance `D_c = sqrt(centroid_dist_sq[c])` and
+  #   a. **Triangle-inequality pruning.** For each probed cell `c` with
+  #      centroid distance `D_c = sqrt(centroid_dist_sq[c])` and
   #      precomputed radius `R_c` (max distance from centroid to any
   #      vector in `c`), no vector in cell `c` can beat the current top-5
   #      worst distance `W` if `(D_c - R_c)² >= W` (and `D_c > R_c`).
@@ -34,21 +33,51 @@ module RinhaDeBackend
   #      with `R_max = max_cell_radius`, no remaining cell can possibly
   #      displace the current top-5. The fraud count is locked — break.
   #
-  # Inside the per-vector inner loop, the squared-L2 is a single straight
-  # 16-lane pass: vector rows are stored at stride 16 with the 14 logical
-  # dims in lanes 0..13 and zero pad in lanes 14..15. With `--mcpu=haswell`
-  # LLVM lowers the loop to one VPMADDWD ymm (5c lat / 1c throughput on
-  # ports P0+P1) producing the full squared inner product for the row in
-  # a single iteration. Decision-aware outer break + bbox prune still
-  # skip whole cells; we only drop the per-dim early-exit because at
-  # 1 cycle per vector it's cheaper to compute the full distance than
-  # to mispredict a per-chunk branch.
+  # Inside each block (AOSOA-8 dim-interleaved):
+  #
+  #   - 8 vectors per block, dim-interleaved as
+  #     `[d0_v0..d0_v7, d1_v0..d1_v7, ..., d13_v0..d13_v7]`.
+  #     With `--mcpu=haswell --mattr=+avx2,+fma` LLVM lowers the per-dim
+  #     8-wide squared-difference loop to (i32 path):
+  #
+  #       vpmovsxwd ymm0, [block + d*16]   ; 8 i16 → 8 i32
+  #       vpsubd    ymm1, ymm0, ymm_qd     ; 8 i32 differences
+  #       vpmulld   ymm2, ymm1, ymm1       ; 8 i32 squares
+  #       vpmovsxdq ymm3, ymm2_lo          ; 4 i64 widened
+  #       vpaddq    ymm_acc_lo, ymm_acc_lo, ymm3
+  #       vextracti128 + vpmovsxdq ymm4    ; 4 i64 high half
+  #       vpaddq    ymm_acc_hi, ymm_acc_hi, ymm4
+  #
+  #     producing 8 partial squared distances per dim instead of 1
+  #     squared distance per row in the old layout.
+  #
+  #   - Multi-stage early exit at d=4 and d=8: if every one of the 8
+  #     partial sums already exceeds the current top-5 worst, skip the
+  #     remainder of the block.
+  #
+  #   - Top-5 insertion sort runs once per block, scanning the 8
+  #     finished partial sums against `worst`. Slots that early-exited
+  #     have all-lanes >= worst, so the same scan correctly admits
+  #     nothing.
+  #
+  # Pad slots and alignment-pad blocks (carrying `IvfBuilder::PAD_SENTINEL =
+  # Int16::MAX` on every lane) produce squared distances ≥ ~7.3 × 10⁹ vs
+  # any production query (lanes ∈ [-10000, 10000]) — well above any real
+  # worst-case real-row L² (~5.6 × 10⁹) — so they cannot enter the top-5
+  # ranking and the block scan needs no per-slot validity bookkeeping.
   #
   # All three cell skips preserve exact answers: no recall loss, just CPU saved.
   class Ivf
     DEFAULT_BASE_NPROBE  =  8
     DEFAULT_RETRY_NPROBE = 16
     TOPK                 =  5
+
+    # Mirrored from References at compile time so the inner loop can use
+    # them as literals (the optimizer won't touch instance attribute
+    # reads inside a hot loop).
+    SLOTS_PER_BLOCK = References::SLOTS_PER_BLOCK # 8
+    LOGICAL_DIMS    = References::LOGICAL_DIMS    # 14
+    BLOCK_LANES     = References::BLOCK_LANES     # 112
 
     def initialize(@refs : References,
                    @base_nprobe : Int32 = DEFAULT_BASE_NPROBE,
@@ -68,8 +97,8 @@ module RinhaDeBackend
     #
     #   Phase A — scan the `base_nprobe` (8) nearest cells. Run the full
     #             pruning stack (per-cell triangle, per-cell bbox,
-    #             decision-aware outer break) and a flat 16-lane L2 inner
-    #             loop (single VPMADDWD ymm under `--mcpu=haswell`).
+    #             decision-aware outer break) and the AOSOA-8 multi-stage
+    #             inner kernel.
     #
     #   Phase B — only when the top-5 from phase A lands at the decision
     #             threshold (`frauds ∈ {2, 3}`, where one swap flips the
@@ -79,8 +108,7 @@ module RinhaDeBackend
     #             so most retries skip cleanly.
     #
     # In the common path (frauds ∈ {0, 1, 4, 5}) the retry is skipped
-    # entirely — mean/p50 latency drops ~2× vs the previous always-16
-    # baseline.
+    # entirely.
     #
     # `@[AlwaysInline]` lets the optimizer fold the whole probe into
     # `handle_fraud_score` so register/spill decisions are made across
@@ -94,7 +122,7 @@ module RinhaDeBackend
     # kernel the same Haswell ISA, without the inlining penalty.
     @[AlwaysInline]
     def fraud_count_top_k(query : StaticArray(Int16, 16)) : Int32
-      vectors         = @refs.vectors
+      blocks          = @refs.blocks
       labels          = @refs.labels
       centroids       = @refs.centroids
       cell_offsets    = @refs.cell_offsets
@@ -108,7 +136,7 @@ module RinhaDeBackend
       total_nprobe    = base_nprobe &+ retry_nprobe
       dims            = References::DIMS
 
-      vec_ptr     = vectors.to_unsafe
+      blk_ptr     = blocks.to_unsafe
       lab_ptr     = labels.to_unsafe
       cent_ptr    = centroids.to_unsafe
       radius_ptr  = cell_radius.to_unsafe
@@ -119,8 +147,7 @@ module RinhaDeBackend
       # ---------------- Stage 1: pick top-`total_nprobe` cells. -----------
       # Always pick the top BASE+RETRY centroids in a single pass — even when
       # phase B is skipped, the centroid-scan cost is dominated by reading
-      # all k centroids. Insertion-sort into more slots is cheap (only when
-      # `worst_probe` is loose, i.e. early in the scan).
+      # all k centroids. Insertion-sort into more slots is cheap.
       probe_dist  = StaticArray(Int64, 32).new(Int64::MAX)
       probe_cell  = StaticArray(Int32, 32).new(0)
       worst_probe = Int64::MAX
@@ -165,9 +192,6 @@ module RinhaDeBackend
       best_label = StaticArray(UInt8, 5).new(0_u8)
       worst = Int64::MAX
 
-      # Phase loop: phase 0 scans probes [0..base_nprobe);
-      #             phase 1 scans probes [base_nprobe..total_nprobe), only
-      #             entered when frauds ∈ {2, 3} after phase 0.
       probe_start = 0
       probe_end   = base_nprobe
       phase = 0
@@ -178,8 +202,7 @@ module RinhaDeBackend
           cell  = probe_cell[p]
           d_root = probe_dist_root[p]
 
-          # (a) Per-cell triangle-inequality skip. `d_root` is floor(sqrt(D²)),
-          # a lower approximation of the true centroid distance.
+          # (a) Per-cell triangle-inequality skip.
           radius = radius_ptr[cell].to_i64
           if d_root > radius
             gap = d_root - radius
@@ -189,10 +212,9 @@ module RinhaDeBackend
             end
           end
 
-          # (b) Per-cell bounding-box exact skip. Min squared
-          # distance from `query` to the axis-aligned bbox of this cell.
-          # Pad lanes (indices 14, 15) carry lo = hi = 0 and the query is
-          # zero on those lanes too, so they contribute nothing.
+          # (b) Per-cell bounding-box exact skip. Pad lanes 14..15 carry
+          # lo = hi = 0 and the query is zero on those lanes too, so they
+          # contribute nothing.
           bb_off = cell &* dims
           bb_d = 0_i64
           bj = 0
@@ -215,64 +237,128 @@ module RinhaDeBackend
             next
           end
 
-          start = cell_offsets[cell].to_i32
-          stop  = cell_offsets[cell &+ 1].to_i32
+          # ----- Cell scan: walk this cell's blocks. -----
+          start_block = cell_offsets[cell].to_i32
+          stop_block  = cell_offsets[cell &+ 1].to_i32
 
-          i = start
-          while i < stop
-            off = i &* dims
+          b = start_block
+          while b < stop_block
+            block_origin = b &* BLOCK_LANES
 
-            # 16-lane straight L2² over a single row.
-            #
-            # On Haswell with `--mcpu=haswell` the loop body lowers to:
-            #   vmovdqu  ymm0, [vec_ptr + off]      ; one row, 32 B aligned
-            #   vmovdqu  ymm1, [query_ptr]          ; broadcast-style reuse
-            #   vpsubw   ymm2, ymm0, ymm1
-            #   vpmaddwd ymm3, ymm2, ymm2           ; 8× (Δ²+Δ²) → 8 i32
-            #   vpmovsxdq+vpaddq → reduce to scalar i64 outside the loop
-            # so the per-vector inner cost is one VPMADDWD (1c thr, P0+P1).
-            d = 0_i64
-            j = 0
-            while j < dims
-              diff = query_ptr[j].to_i32 &- vec_ptr[off &+ j].to_i32
-              d &+= (diff &* diff).to_i64
-              j &+= 1
-            end
+            # Per-block 8-wide partial squared-L² accumulators. Use Int64
+            # because pad-sentinel slots can blow Int32 (per-stage sum
+            # against a sentinel slot ~ 14 × 1.8e9 ≈ 2.5e10, overflows
+            # i32). LLVM still vectorizes the per-dim loop into ymm i32
+            # multiplies + ymm i64 accumulates.
+            partial = StaticArray(Int64, 8).new(0_i64)
 
-            # Asymmetric tie-break (F1.4): on equal distance, fraud wins
-            # over legit. The rinha score weights FN at 3× FP, so on a
-            # tie the expected-cost optimum is to surface the fraud.
-            # Effects: (a) admit a fraud at d == worst when the worst
-            # slot is legit; (b) when shifting, treat ties between a
-            # fraud incoming and a legit existing as "shift" too.
-            # Stays in the post-kernel insertion sort — the SIMD inner
-            # loop above is untouched.
-            new_label = lab_ptr[i]
-            new_is_fraud = new_label == References::LABEL_FRAUD
-            tie_admit = new_is_fraud && d == worst && best_label[TOPK &- 1] == References::LABEL_LEGIT
-            if d < worst || tie_admit
-              slot = TOPK &- 1
-              while slot > 0
-                bd = best_dist[slot &- 1]
-                bl = best_label[slot &- 1]
-                shift = bd > d || (new_is_fraud && bd == d && bl == References::LABEL_LEGIT)
-                break unless shift
-                best_dist[slot]  = bd
-                best_label[slot] = bl
-                slot &-= 1
+            # Stage 1: dims 0..3.
+            d = 0
+            while d < 4
+              base = d &* SLOTS_PER_BLOCK
+              qd = query_ptr[d].to_i32
+              s = 0
+              while s < SLOTS_PER_BLOCK
+                diff = blk_ptr[block_origin &+ base &+ s].to_i32 &- qd
+                partial[s] &+= (diff &* diff).to_i64
+                s &+= 1
               end
-              best_dist[slot]  = d
-              best_label[slot] = new_label
-              worst = best_dist[TOPK &- 1]
+              d &+= 1
             end
 
-            i &+= 1
+            # Stage 1 early exit: if EVERY lane already meets/exceeds
+            # `worst`, no slot in this block can enter top-5 even if the
+            # remaining dims contribute zero. Skip to next block.
+            all_exceed = true
+            ss = 0
+            while ss < SLOTS_PER_BLOCK
+              if partial[ss] < worst
+                all_exceed = false
+                break
+              end
+              ss &+= 1
+            end
+            if all_exceed
+              b &+= 1
+              next
+            end
+
+            # Stage 2: dims 4..7.
+            d = 4
+            while d < 8
+              base = d &* SLOTS_PER_BLOCK
+              qd = query_ptr[d].to_i32
+              s = 0
+              while s < SLOTS_PER_BLOCK
+                diff = blk_ptr[block_origin &+ base &+ s].to_i32 &- qd
+                partial[s] &+= (diff &* diff).to_i64
+                s &+= 1
+              end
+              d &+= 1
+            end
+
+            all_exceed = true
+            ss = 0
+            while ss < SLOTS_PER_BLOCK
+              if partial[ss] < worst
+                all_exceed = false
+                break
+              end
+              ss &+= 1
+            end
+            if all_exceed
+              b &+= 1
+              next
+            end
+
+            # Stage 3: dims 8..13 (LOGICAL_DIMS = 14).
+            d = 8
+            while d < LOGICAL_DIMS
+              base = d &* SLOTS_PER_BLOCK
+              qd = query_ptr[d].to_i32
+              s = 0
+              while s < SLOTS_PER_BLOCK
+                diff = blk_ptr[block_origin &+ base &+ s].to_i32 &- qd
+                partial[s] &+= (diff &* diff).to_i64
+                s &+= 1
+              end
+              d &+= 1
+            end
+
+            # Insertion: scan the 8 finished partial sums, admit slots
+            # that beat (or tie-break, asymmetric) the current top-5.
+            slot_global_base = b &* SLOTS_PER_BLOCK
+            slot = 0
+            while slot < SLOTS_PER_BLOCK
+              dst = partial[slot]
+              new_label = lab_ptr[slot_global_base &+ slot]
+              new_is_fraud = new_label == References::LABEL_FRAUD
+              # F1.4 asymmetric tie-break: on equal distance, fraud wins
+              # over legit; FN penalty (3×) outweighs FP (1×) so the
+              # expected-cost optimum is to surface the fraud.
+              tie_admit = new_is_fraud && dst == worst && best_label[TOPK &- 1] == References::LABEL_LEGIT
+              if dst < worst || tie_admit
+                ins = TOPK &- 1
+                while ins > 0
+                  bd = best_dist[ins &- 1]
+                  bl = best_label[ins &- 1]
+                  shift = bd > dst || (new_is_fraud && bd == dst && bl == References::LABEL_LEGIT)
+                  break unless shift
+                  best_dist[ins]  = bd
+                  best_label[ins] = bl
+                  ins &-= 1
+                end
+                best_dist[ins]  = dst
+                best_label[ins] = new_label
+                worst = best_dist[TOPK &- 1]
+              end
+              slot &+= 1
+            end
+
+            b &+= 1
           end
 
-          # (c) Decision-aware outer break. Probes are sorted ascending by
-          # centroid distance; once the *next* probe is far enough that even
-          # a cell of `max_cell_radius` couldn't displace the current top-5,
-          # neither can any remaining probe in this phase.
+          # (c) Decision-aware outer break.
           next_p = p &+ 1
           if next_p < probe_end
             next_root = probe_dist_root[next_p]
@@ -295,12 +381,7 @@ module RinhaDeBackend
           kk &+= 1
         end
 
-        # Boundary retry only on the decision edge. The fixed
-        # threshold is 0.6 → frauds < 3 ⇒ approve. Top-5 with frauds in
-        # {2, 3} is the "one neighbor away from flipping" zone, where the
-        # extra 16 cells can move the answer; outside that zone, the
-        # current top-5 already locks in the decision regardless of any
-        # cells we'd scan next.
+        # Boundary retry only on the decision edge.
         break unless frauds_now == 2 || frauds_now == 3
 
         probe_start = base_nprobe

@@ -2,10 +2,11 @@ require "../src/references"
 require "../src/ivf"
 
 # Verifies that the cell-pruning optimizations in `Ivf` (triangle-inequality
-# per-cell skip + max_cell_radius outer break) preserve the exact same
-# fraud-count answer as the *unpruned* IVF reference inlined below. Both
+# per-cell skip + max_cell_radius outer break + bbox skip) preserve the exact
+# same fraud-count answer as the *unpruned* IVF reference inlined below. Both
 # scan the same nprobe cells over the full 3M dataset; the only difference
-# is whether the per-cell triangle bound and outer break are honored.
+# is whether the per-cell triangle bound, bbox bound, and outer break are
+# honored.
 #
 # Comparing against unpruned IVF (rather than brute-force) isolates the
 # effect of the cell pruning from the pre-existing IVF-vs-brute-force gap
@@ -23,14 +24,17 @@ module RinhaDeBackend
 
   BASE_NPROBE  = Ivf::DEFAULT_BASE_NPROBE
   RETRY_NPROBE = Ivf::DEFAULT_RETRY_NPROBE
+  SLOTS_PER_BLOCK = References::SLOTS_PER_BLOCK
+  LOGICAL_DIMS    = References::LOGICAL_DIMS
+  BLOCK_LANES     = References::BLOCK_LANES
 
   # Unpruned reference: identical phase / boundary-retry structure as
-  # `Ivf#fraud_count_top_k`, but without the per-cell triangle-inequality
-  # skip, without the per-cell bbox skip, and without the decision-aware
-  # outer break. Comparing pruned vs unpruned with the same retry policy
-  # isolates the effect of the cell-pruning skips from the retry logic.
+  # `Ivf#fraud_count_top_k`, walking the AOSOA-8 block layout, but with
+  # NO triangle/bbox per-cell skips and NO multi-stage early exit.
+  # Comparing pruned vs unpruned with the same retry policy isolates
+  # the effect of the cell-pruning skips.
   def self.fraud_count_unpruned(query : StaticArray(Int16, 16)) : Int32
-    vectors      = REFS.vectors
+    blocks       = REFS.blocks
     labels       = REFS.labels
     centroids    = REFS.centroids
     cell_offsets = REFS.cell_offsets
@@ -40,7 +44,7 @@ module RinhaDeBackend
     total_nprobe = base_nprobe + retry_nprobe
     dims         = References::DIMS
 
-    vec_ptr   = vectors.to_unsafe
+    blk_ptr   = blocks.to_unsafe
     lab_ptr   = labels.to_unsafe
     cent_ptr  = centroids.to_unsafe
     query_ptr = query.to_unsafe
@@ -87,34 +91,53 @@ module RinhaDeBackend
       p = probe_start
       while p < probe_end
         cell  = probe_cell[p]
-        start = cell_offsets[cell].to_i32
-        stop  = cell_offsets[cell &+ 1].to_i32
+        start_block = cell_offsets[cell].to_i32
+        stop_block  = cell_offsets[cell &+ 1].to_i32
 
-        i = start
-        while i < stop
-          off = i * dims
-          d = 0_i64
-          j = 0
-          while j < dims
-            diff = query_ptr[j].to_i32 - vec_ptr[off + j].to_i32
-            d &+= (diff &* diff).to_i64
-            break if d >= worst
-            j &+= 1
-          end
+        b = start_block
+        while b < stop_block
+          block_origin = b &* BLOCK_LANES
+          partial = StaticArray(Int64, 8).new(0_i64)
 
-          if d < worst
-            slot = K &- 1
-            while slot > 0 && best_dist[slot &- 1] > d
-              best_dist[slot]  = best_dist[slot &- 1]
-              best_label[slot] = best_label[slot &- 1]
-              slot &-= 1
+          d = 0
+          while d < LOGICAL_DIMS
+            base = d &* SLOTS_PER_BLOCK
+            qd = query_ptr[d].to_i32
+            s = 0
+            while s < SLOTS_PER_BLOCK
+              diff = blk_ptr[block_origin &+ base &+ s].to_i32 &- qd
+              partial[s] &+= (diff &* diff).to_i64
+              s &+= 1
             end
-            best_dist[slot]  = d
-            best_label[slot] = lab_ptr[i]
-            worst = best_dist[K &- 1]
+            d &+= 1
           end
 
-          i &+= 1
+          slot_global_base = b &* SLOTS_PER_BLOCK
+          slot = 0
+          while slot < SLOTS_PER_BLOCK
+            dst = partial[slot]
+            new_label = lab_ptr[slot_global_base &+ slot]
+            new_is_fraud = new_label == References::LABEL_FRAUD
+            tie_admit = new_is_fraud && dst == worst && best_label[K &- 1] == References::LABEL_LEGIT
+            if dst < worst || tie_admit
+              ins = K &- 1
+              while ins > 0
+                bd = best_dist[ins &- 1]
+                bl = best_label[ins &- 1]
+                shift = bd > dst || (new_is_fraud && bd == dst && bl == References::LABEL_LEGIT)
+                break unless shift
+                best_dist[ins]  = bd
+                best_label[ins] = bl
+                ins &-= 1
+              end
+              best_dist[ins]  = dst
+              best_label[ins] = new_label
+              worst = best_dist[K &- 1]
+            end
+            slot &+= 1
+          end
+
+          b &+= 1
         end
 
         p &+= 1
@@ -144,6 +167,17 @@ module RinhaDeBackend
     frauds
   end
 
+  # Sample a non-pad slot (skip alignment pads / tail pads).
+  def self.sample_real_slot(blocks : Slice(Int16), padded_count : Int32, rng : Random) : Int32
+    loop do
+      idx = rng.rand(padded_count)
+      block_idx = idx // SLOTS_PER_BLOCK
+      slot      = idx - block_idx * SLOTS_PER_BLOCK
+      lane0 = blocks[block_idx * BLOCK_LANES + slot]
+      return idx unless lane0 == Int16::MAX
+    end
+  end
+
   STDERR.puts "[prune] count=#{REFS.count} k=#{REFS.k} max_cell_radius=#{REFS.max_cell_radius} base=#{BASE_NPROBE} retry=#{RETRY_NPROBE} samples=#{N_QUERY} seed=#{SEED} jitter=#{JITTER}"
   STDERR.flush
 
@@ -155,15 +189,15 @@ module RinhaDeBackend
   unpruned_ms = 0.0
 
   N_QUERY.times do |i|
-    idx = rng.rand(REFS.count)
-    src = idx * References::DIMS
+    idx = sample_real_slot(REFS.blocks, REFS.padded_count, rng)
+    block_idx = idx // SLOTS_PER_BLOCK
+    slot      = idx - block_idx * SLOTS_PER_BLOCK
+    block_origin = block_idx * BLOCK_LANES
 
-    # Query mirrors the on-disk row layout: 14 jittered logical lanes
-    # plus 2 zero pad lanes (left at 0 by the StaticArray initializer).
     query = StaticArray(Int16, 16).new(0_i16)
     j = 0
-    while j < References::LOGICAL_DIMS
-      v = REFS.vectors[src + j].to_i32
+    while j < LOGICAL_DIMS
+      v = REFS.blocks[block_origin + j * SLOTS_PER_BLOCK + slot].to_i32
       if JITTER > 0
         v += rng.rand(-JITTER..JITTER)
         v = Int16::MIN.to_i32 if v < Int16::MIN

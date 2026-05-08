@@ -7,75 +7,98 @@ module RinhaDeBackend
   # file produced once at Docker build time and mmapped read-only at
   # runtime.
   #
-  #   - `vectors`     : Slice(Int16), length = count * DIMS, row-major,
-  #                     reordered so that vectors of the same IVF cell
-  #                     are contiguous. Each row is `DIMS = 16` Int16
-  #                     lanes (32 bytes, naturally aligned for AVX2):
-  #                     14 logical feature lanes followed by 2 zero-pad
-  #                     lanes so a single VPMADDWD ymm covers the full
-  #                     squared-L2 inner product (Haswell: 5c lat /
-  #                     1c throughput). Pad lanes are zero on both
-  #                     stored vectors and queries, so they contribute
-  #                     0 to every distance and bbox check.
-  #   - `labels`      : Slice(UInt8), length = count, 1 = fraud, 0 = legit,
-  #                     reordered the same way as `vectors`.
+  # Two on-disk slice layouts are kept, both read by the same `References`
+  # instance depending on which loader was used:
+  #
+  # 1. Row-major (`vectors` slice, `block_count == 0`) — produced by the
+  #    legacy `load_from_io` JSON loader and used by spec fixtures. Each
+  #    row is `DIMS = 16` Int16 lanes (14 logical + 2 zero pad). Hot path
+  #    is unchanged from RNH5/RNH6.
+  #
+  # 2. AOSOA-8 dim-interleaved blocks (`blocks` slice, `block_count > 0`)
+  #    — produced by `IvfBuilder` and consumed by the runtime IVF kernel.
+  #    Each block holds 8 vectors with their dims interleaved: lanes
+  #    `[d0_v0..d0_v7, d1_v0..d1_v7, ..., d13_v0..d13_v7]`, total
+  #    `LOGICAL_DIMS × SLOTS_PER_BLOCK = 112` Int16 lanes = 224 B per
+  #    block. The runtime scan loads 8 i16 of one dim with a single
+  #    VPMOVSXWD / VPSUBD / VPMULLD / VPADDQ chain, producing 8 squared
+  #    distances per dim instead of one per row. Multi-stage early exit
+  #    (between dim 4 and dim 8) skips a whole block of 8 vectors when
+  #    every lane already exceeds the current top-5 worst.
+  #
+  # Common (both layouts):
+  #   - `labels`      : Slice(UInt8). Row-major: length = padded_count,
+  #                     one per row. Block: length = block_count *
+  #                     SLOTS_PER_BLOCK = padded_count, one per slot, in
+  #                     block-major slot order (block 0 slots 0..7, block 1
+  #                     slots 0..7, ...).
   #   - `centroids`   : Slice(Int16), length = k * DIMS, the IVF cell
-  #                     centers (quantized to the same scale as vectors,
-  #                     same 14+2 zero-pad layout).
-  #   - `cell_offsets`: Slice(UInt32), length = k + 1; cell `c` spans
-  #                     `vectors[cell_offsets[c]..cell_offsets[c+1])`.
+  #                     centers (quantized, 14+2 zero-pad row stride —
+  #                     keeps centroid scan on the VPMADDWD path).
+  #   - `cell_offsets`: Slice(UInt32), length = k + 1. Row layout: row
+  #                     index. Block layout: block index (always even,
+  #                     so cell starts land on a 64 B boundary). Cell c
+  #                     spans `[cell_offsets[c], cell_offsets[c+1])`
+  #                     in whichever unit applies.
   #   - `cell_radius` : Slice(UInt32), length = k; max non-squared L2
   #                     distance from quantized centroid `c` to any vector
-  #                     in cell `c` (ceil). Used at query time for the
-  #                     triangle-inequality cell-pruning check.
+  #                     in cell `c` (ceil). Computed over real rows only
+  #                     (pad slots/rows excluded — sentinel would torpedo
+  #                     every triangle-inequality prune).
   #   - `max_cell_radius`: max over `cell_radius`. Cached in the header so
   #                       the runtime can use it for a global outer-break
   #                       check without scanning the per-cell array.
-  #   - `bbox_min`    : Slice(Int16), length = k * DIMS. Per-cell axis-
-  #                     aligned bounding box minimum per dimension
-  #                     (pad lanes pinned to 0).
-  #   - `bbox_max`    : Slice(Int16), length = k * DIMS. Per-cell axis-
-  #                     aligned bounding box maximum per dimension
-  #                     (pad lanes pinned to 0).
-  #                     Used at query time for an exact cell-pruning
-  #                     check tighter than triangle-inequality.
+  #   - `bbox_min` / `bbox_max` : Slice(Int16), length = k * DIMS.
+  #                     Per-cell axis-aligned bounding box per dimension
+  #                     (pad lanes pinned to 0). Used at query time for an
+  #                     exact cell-pruning check tighter than triangle-
+  #                     inequality.
   #
   # Floats are quantized as `(v * 10_000).round.to_i16`. The `-1`
   # sentinel for indices 5/6 (no last_transaction) maps to `-10_000`,
   # naturally outside the [0, 10_000] band.
   #
-  # Binary file format (little-endian, x86_64):
+  # Binary file format (little-endian, x86_64) — bumped to RNH7 with
+  # AOSOA-8 dim-interleaved blocks:
   #
-  #   bytes  0..3   : magic "RNH6"   (bumped from RNH5 when each cell's
-  #                                   start row was aligned to 64 B with
-  #                                   optional pad rows at the tail)
-  #   bytes  4..7   : count u32 (real, unpadded — for stats / legacy)
-  #   bytes  8..11  : dims  u32 (= 16, the row stride)
+  #   bytes  0..3   : magic "RNH7"   (was RNH6 row-major stride-16)
+  #   bytes  4..7   : count u32 (real, unpadded — for stats)
+  #   bytes  8..11  : dims  u32 (= 16, kept for centroid/bbox stride)
   #   bytes 12..15  : k     u32 (number of IVF cells)
   #   bytes 16..19  : max_cell_radius u32
-  #   bytes 20..23  : padded_count u32 (>= count, <= count + k)
-  #   bytes 24..63  : reserved (zeroed)
-  #   bytes 64..    : vectors (padded_count * dims * Int16, reordered by
-  #                            cell, each cell at an even row index)
-  #   then          : labels  (padded_count * UInt8, reordered by cell)
-  #   then          : centroids (k * dims * Int16)
-  #   then          : cell_offsets ((k + 1) * UInt32)
+  #   bytes 20..23  : padded_count u32 (= block_count * SLOTS_PER_BLOCK)
+  #   bytes 24..27  : block_count u32 (total blocks, including alignment pads)
+  #   bytes 28..63  : reserved (zeroed)
+  #   bytes 64..    : blocks (block_count * BLOCK_LANES * Int16, dim-
+  #                            interleaved, each cell starts at an even
+  #                            block index = 64 B aligned)
+  #   then          : labels  (block_count * SLOTS_PER_BLOCK * UInt8,
+  #                            slot-major; pad slots carry label 0)
+  #   then          : centroids (k * dims * Int16, stride 16)
+  #   then          : cell_offsets ((k + 1) * UInt32, block indices)
   #   then          : cell_radius (k * UInt32)
-  #   then          : bbox_min (k * dims * Int16)
-  #   then          : bbox_max (k * dims * Int16)
+  #   then          : bbox_min (k * dims * Int16, stride 16)
+  #   then          : bbox_max (k * dims * Int16, stride 16)
   class References
     DEFAULT_PATH     = "resources/references.json.gz"
     DEFAULT_BIN_PATH = "resources/references.bin"
 
-    # Row stride in Int16 lanes (also the count Float lanes the
-    # vectorizer emits, padded to a multiple of 16). The 14 logical
-    # feature dimensions live at indices 0..13; indices 14..15 are
-    # always zero on both stored vectors and queries.
+    # Row stride in Int16 lanes for centroids and bbox (kept at 16 so the
+    # centroid scan keeps emitting one VPMADDWD ymm per centroid). The 14
+    # logical feature dimensions live at indices 0..13; indices 14..15 are
+    # always zero.
     DIMS = 16
-    # Number of logical (non-pad) feature dims. Useful for code that
-    # walks only the fields the vectorizer actually fills.
+    # Number of logical (non-pad) feature dims. Block dim-interleaved
+    # layout uses exactly LOGICAL_DIMS dims (no pad lanes — the AOSOA-8
+    # kernel processes one dim at a time so unused lanes would be wasted
+    # work).
     LOGICAL_DIMS = 14
-    SCALE        = 10_000.0_f64
+    # AOSOA-8 block: 8 vectors per block, dim-interleaved. One block
+    # spans LOGICAL_DIMS * SLOTS_PER_BLOCK = 112 Int16 lanes = 224 B.
+    SLOTS_PER_BLOCK = 8
+    BLOCK_LANES     = LOGICAL_DIMS * SLOTS_PER_BLOCK # 112
+    BLOCK_BYTES     = BLOCK_LANES * sizeof(Int16)    # 224
+    SCALE           = 10_000.0_f64
 
     LABEL_LEGIT = 0_u8
     LABEL_FRAUD = 1_u8
@@ -83,16 +106,26 @@ module RinhaDeBackend
     DEFAULT_CAPACITY = 3_000_000
 
     HEADER_SIZE  =     64
-    HEADER_MAGIC = "RNH6"
+    HEADER_MAGIC = "RNH7"
 
     getter count : Int32
-    # Number of rows in `vectors` / `labels`. Equals `count` for the
-    # gzip-JSON loader (no IVF, no padding); for the IVF mmap path it can
-    # be up to `count + k` to keep each cell's start row at a 64 B
-    # boundary. Pad rows carry `IvfBuilder::PAD_SENTINEL` per lane and
-    # are guaranteed never to enter the top-5 ranking.
+    # Total slot count exposed by `labels` and (in row layout) `vectors`.
+    # Row layout: `padded_count` rows in `vectors`. Block layout:
+    # `block_count * SLOTS_PER_BLOCK` slots, in slot-major order across
+    # `labels`. Pad slots/rows carry `IvfBuilder::PAD_SENTINEL` per lane
+    # (or label 0) and are guaranteed never to enter the top-5 ranking.
     getter padded_count : Int32
+    # Row-major vectors slice, populated only by `load_from_io` (legacy
+    # JSON path, fixture tests). Empty `Slice(Int16).new(0, 0_i16)` on
+    # the IVF mmap path — use `blocks` instead.
     getter vectors : Slice(Int16)
+    # AOSOA-8 dim-interleaved blocks, populated only by the IVF mmap
+    # path. Empty on the legacy JSON loader path.
+    getter blocks : Slice(Int16)
+    # Number of blocks, total (including alignment pads inserted to keep
+    # each cell's start at an even block index). 0 on the legacy
+    # row-major path.
+    getter block_count : Int32
     getter labels : Slice(UInt8)
     getter k : Int32
     getter centroids : Slice(Int16)
@@ -117,6 +150,8 @@ module RinhaDeBackend
                            @vectors : Slice(Int16),
                            @labels : Slice(UInt8),
                            @padded_count : Int32,
+                           @blocks : Slice(Int16) = Slice(Int16).new(0, 0_i16),
+                           @block_count : Int32 = 0,
                            @k : Int32 = 0,
                            @centroids : Slice(Int16) = Slice(Int16).new(0, 0_i16),
                            @cell_offsets : Slice(UInt32) = Slice(UInt32).new(0, 0_u32),
@@ -178,11 +213,13 @@ module RinhaDeBackend
       k     = (base + 12).as(UInt32*).value.to_i32
       max_cell_radius = (base + 16).as(UInt32*).value
       padded_count = (base + 20).as(UInt32*).value.to_i32
+      block_count  = (base + 24).as(UInt32*).value.to_i32
       raise "dims mismatch in #{path}: #{dims} != #{DIMS} (rebuild references.bin — header expects stride #{DIMS})" unless dims == DIMS
       raise "padded_count (#{padded_count}) < count (#{count}) in #{path}" if padded_count < count
+      raise "block_count (#{block_count}) * SLOTS_PER_BLOCK (#{SLOTS_PER_BLOCK}) != padded_count (#{padded_count}) in #{path}" if block_count * SLOTS_PER_BLOCK != padded_count
 
-      vectors_off      = HEADER_SIZE
-      labels_off       = vectors_off + padded_count * DIMS * sizeof(Int16)
+      blocks_off       = HEADER_SIZE
+      labels_off       = blocks_off + block_count * BLOCK_LANES * sizeof(Int16)
       centroids_off    = labels_off + padded_count * sizeof(UInt8)
       cell_offsets_off = centroids_off + k * DIMS * sizeof(Int16)
       cell_radius_off  = cell_offsets_off + (k + 1) * sizeof(UInt32)
@@ -191,7 +228,7 @@ module RinhaDeBackend
       end_off          = bbox_max_off + k * DIMS * sizeof(Int16)
       raise "size mismatch in #{path}: #{size_i64} != #{end_off}" unless size_i64 == end_off
 
-      vectors_ptr      = (base + vectors_off).as(Int16*)
+      blocks_ptr       = (base + blocks_off).as(Int16*)
       labels_ptr       = (base + labels_off).as(UInt8*)
       centroids_ptr    = (base + centroids_off).as(Int16*)
       cell_offsets_ptr = (base + cell_offsets_off).as(UInt32*)
@@ -199,7 +236,7 @@ module RinhaDeBackend
       bbox_min_ptr     = (base + bbox_min_off).as(Int16*)
       bbox_max_ptr     = (base + bbox_max_off).as(Int16*)
 
-      vectors      = Slice(Int16).new(vectors_ptr, padded_count * DIMS, read_only: true)
+      blocks       = Slice(Int16).new(blocks_ptr, block_count * BLOCK_LANES, read_only: true)
       labels       = Slice(UInt8).new(labels_ptr, padded_count, read_only: true)
       centroids    = Slice(Int16).new(centroids_ptr, k * DIMS, read_only: true)
       cell_offsets = Slice(UInt32).new(cell_offsets_ptr, k + 1, read_only: true)
@@ -207,7 +244,11 @@ module RinhaDeBackend
       bbox_min     = Slice(Int16).new(bbox_min_ptr, k * DIMS, read_only: true)
       bbox_max     = Slice(Int16).new(bbox_max_ptr, k * DIMS, read_only: true)
 
-      new(count, vectors, labels, padded_count, k, centroids, cell_offsets,
+      # Empty row-major slice on the IVF path — callers use `blocks`.
+      empty_vectors = Slice(Int16).new(0, 0_i16)
+
+      new(count, empty_vectors, labels, padded_count,
+          blocks, block_count, k, centroids, cell_offsets,
           cell_radius, max_cell_radius, bbox_min, bbox_max, base,
           size_i64.to_i64)
     end
@@ -326,7 +367,7 @@ module RinhaDeBackend
       output_io.write(Bytes.new(HEADER_SIZE, 0_u8))
 
       # Sections.
-      output_io.write(result.vectors.to_unsafe_bytes)
+      output_io.write(result.blocks.to_unsafe_bytes)
       output_io.write(result.labels.to_unsafe_bytes)
       output_io.write(result.centroids.to_unsafe_bytes)
       output_io.write(result.cell_offsets.to_unsafe_bytes)
@@ -342,6 +383,7 @@ module RinhaDeBackend
       output_io.write_bytes(k.to_u32, IO::ByteFormat::LittleEndian)
       output_io.write_bytes(result.max_cell_radius, IO::ByteFormat::LittleEndian)
       output_io.write_bytes(result.padded_count.to_u32, IO::ByteFormat::LittleEndian)
+      output_io.write_bytes(result.block_count.to_u32, IO::ByteFormat::LittleEndian)
 
       raw.count
     end
